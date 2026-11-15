@@ -63,13 +63,13 @@ Unlike a heightmap, it can describe caves, tunnels and overhangs.
 
 `dens(p)` in `shaders-terrain.js` combines a base seafloor, multi-octave noise,
 smooth unions with rock masses and arches, and subtraction for tunnel cylinders.
-`surfaceNets()` in `math.js` extracts a polygonal surface at the zero crossing,
-and `buildTerrain()` in `world.js` packs positions and normals and groups
+`extractSurfaceNets()` in `math.js` extracts a polygonal surface at the zero crossing,
+and `extractTerrainMesh()` in `world.js` packs positions and normals and groups
 triangles into horizontal culling cells.
 
 ## How there can be so much kelp
 
-`makeWorld()` scatters vegetation using a deterministic seeded PRNG.
+`populateProceduralWorld()` scatters vegetation using a deterministic seeded PRNG.
 It writes packed instance attributes grouped by camera-culling cell.
 Blades are **generated procedurally in the vertex shader**, not stored as
 individual detailed meshes. The renderer selects 9-row, 5-row, or simplified
@@ -109,7 +109,7 @@ Depth-aware ray blur          Bloom upsample
 Important source functions/strings:
 
 - `render()`: records the render and post-processing passes.
-- `drawCells()`: selects only nearby and visible instance cells.
+- `drawVisibleCells()`: selects only nearby and visible instance cells.
 - `W_WATER`: updates the animated water lookup texture.
 - `W_RAYS`: integrates volumetric light at half resolution.
 - `W_RBLUR`: depth-aware smoothing of those rays.
@@ -180,3 +180,33 @@ A next refactor pass can isolate `main.js` functions for resource setup,
 pipeline construction, terrain readback and render-pass encoding, followed by
 more descriptive local names. Keep those changes separate so visual or
 performance regressions are easy to attribute.
+
+## Readability refactor: important names
+
+The original compact names are intentionally retained for the WGSL programs and
+for a few hot-path packed numeric structures. JavaScript call sites use clearer
+names where possible:
+
+| Before | Now | Purpose |
+|---|---|---|
+| `buf` | `uploadGpuBuffer` | Allocate and upload GPU data |
+| `tex` | `createGpuTexture` | Create 2D/3D targets |
+| `mod` | `createShaderModule` | Compile a WGSL source string |
+| `drawCells` | `drawVisibleCells` | Cull and batch spatial cells |
+| `collide` | `resolveCameraCollisions` | Slide the swimmer along rocks |
+| `sd` | `sampleRockDistance` | Trilinear collision-distance sampling |
+| `primBuffer` | `packTerrainPrimitives` | GPU-ready mesa/arch/tunnel records |
+| `makeWorld` | `populateProceduralWorld` | Plant and populate the static scene |
+| `meshFluke` | `createWhaleFlukeGeometry` | Procedural landmark mesh |
+
+The top-level `frame()` now delegates quality tuning and swimming controls to
+`updateAdaptiveQuality()` and `updateCameraMovement()`. The instanced kelp
+generator `addKelpColumn()` is organized as stem paths, blades, highlights and
+a coarse absorption volume.
+
+**Important:** This branch has been checked for combined JavaScript syntax and
+cross-file helper naming, but it has **not been GPU-rendered or screenshot-
+compared** in this environment. Before merging, use `npm ci` and
+`npm run build:readable` in `source/`, then inspect all six viewpoints and
+run `npm run build:dev` to test the benchmark path. Visual and WebGPU validation
+are still required.
