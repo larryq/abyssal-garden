@@ -423,36 +423,88 @@ const submitList = [null];
 const rowsNearToFar = new Uint8Array(CELLS);
 // Draws the cells of a cell-sorted buffer that are in view and within [minD, maxD) (scaled by `det`, but not for the
 // terrain) as merged runs, nearest rows first.
-function drawVisibleCells(renderPass, cellOffsets, cellMinY, cellMaxY, padding, geometry, verticesPerInstance, nearDistance, farDistance) {
-  // Work with the camera basis already computed by render(). All positions are
-  // compared relative to the camera, and the squared-distance check avoids sqrt().
-  const cx = F[CX], cy = F[CY], cz = F[CZ], fx = F[FX], fy = F[FY], fz = F[FZ], rx = F[RX], rz = F[RZ], ux = F[UX], uy = F[UY], uz = F[UZ];
-  const ds = geometry === 1 ? 1 : det * det;
-  const tx = TANH * W / H, hw = CELLW * 0.5, ex = hw + padding, min2 = nearDistance * nearDistance * ds, max2 = farDistance * farDistance * ds;
-  for (let k = 0; k < CELLS; k++) {
-    const gridRow = rowsNearToFar[k], rowStart = gridRow * CELLS, relativeZ = OZ + (gridRow + 0.5) * CELLW - cz, distanceOutsideZ = max(abs(relativeZ) - hw, 0);
-    // Merge consecutive visible cells into one instanced draw call.
+function drawVisibleCells(
+  renderPass, cellOffsets, cellMinY, cellMaxY, padding,
+  geometry, verticesPerInstance, nearDistance, farDistance
+) {
+  // The frustum's basis vectors come from the current camera. Use bounding
+  // cells rather than individual instances to avoid expensive per-leaf tests.
+  const cx = F[CX], cy = F[CY], cz = F[CZ];
+  const fx = F[FX], fy = F[FY], fz = F[FZ];
+  const rx = F[RX], rz = F[RZ];
+  const ux = F[UX], uy = F[UY], uz = F[UZ];
+
+  // Terrain is never affected by adaptive detail distance scaling.
+  const scaleSquared = geometry === 1 ? 1 : det * det;
+  const minDistanceSquared = nearDistance * nearDistance * scaleSquared;
+  const maxDistanceSquared = farDistance * farDistance * scaleSquared;
+  const halfCell = CELLW * 0.5;
+  const expandedHalfCell = halfCell + padding;
+  const horizontalFov = TANH * W / H;
+
+  for (let rowIndex = 0; rowIndex < CELLS; rowIndex++) {
+    const gridRow = rowsNearToFar[rowIndex];
+    const rowStart = gridRow * CELLS;
+    const relativeZ = OZ + (gridRow + 0.5) * CELLW - cz;
+    const outsideZ = max(abs(relativeZ) - halfCell, 0);
+
+    // Adjacent visible cells share one instanced draw call.
     let visibleRunStart = -1;
     for (let x = 0; x <= CELLS; x++) {
-      const cellIndex = rowStart + x; let isVisible = false;
+      const cellIndex = rowStart + x;
+      let isVisible = false;
       if (x < CELLS) {
-        const lowestY = cellMinY[cellIndex], highestY = cellMaxY[cellIndex];
-        if (lowestY <= highestY) {
-          const relativeX = OX + (x + 0.5) * CELLW - cx, relativeY = (lowestY + highestY) * 0.5 - cy, verticalHalfExtent = (highestY - lowestY) * 0.5 + padding, distanceOutsideX = max(abs(relativeX) - hw, 0), horizontalDistanceSquared = distanceOutsideX * distanceOutsideX + distanceOutsideZ * distanceOutsideZ;
-          if (horizontalDistanceSquared < max2 && horizontalDistanceSquared >= min2) {
-            const forwardExtent = relativeX * fx + relativeY * fy + relativeZ * fz + ex * abs(fx) + verticalHalfExtent * abs(fy) + ex * abs(fz);
-            if (forwardExtent >= 0 && abs(relativeX * rx + relativeZ * rz) - ex * (abs(rx) + abs(rz)) <= forwardExtent * tx) isVisible = abs(relativeX * ux + relativeY * uy + relativeZ * uz) - ex * (abs(ux) + abs(uz)) - verticalHalfExtent * abs(uy) <= forwardExtent * TANH;
+        const minY = cellMinY[cellIndex], maxY = cellMaxY[cellIndex];
+        if (minY <= maxY) {
+          const relativeX = OX + (x + 0.5) * CELLW - cx;
+          const relativeY = (minY + maxY) * 0.5 - cy;
+          const halfHeight = (maxY - minY) * 0.5 + padding;
+          const outsideX = max(abs(relativeX) - halfCell, 0);
+          const distanceSquared = outsideX * outsideX + outsideZ * outsideZ;
+
+          if (distanceSquared < maxDistanceSquared && distanceSquared >= minDistanceSquared) {
+            // Conservative frustum test: project the cell's expanded bounding
+            // box onto camera-forward, right and up directions.
+            const forward =
+              relativeX * fx + relativeY * fy + relativeZ * fz
+              + expandedHalfCell * abs(fx) + halfHeight * abs(fy)
+              + expandedHalfCell * abs(fz);
+            const right =
+              abs(relativeX * rx + relativeZ * rz)
+              - expandedHalfCell * (abs(rx) + abs(rz));
+            if (forward >= 0 && right <= forward * horizontalFov) {
+              const up =
+                abs(relativeX * ux + relativeY * uy + relativeZ * uz)
+                - expandedHalfCell * (abs(ux) + abs(uz)) - halfHeight * abs(uy);
+              isVisible = up <= forward * TANH;
+            }
           }
         }
       }
-      if (isVisible) { if (visibleRunStart < 0) visibleRunStart = cellIndex; } else if (visibleRunStart >= 0) {
-        const firstInstance = cellOffsets[visibleRunStart], instanceCount = cellOffsets[cellIndex] - firstInstance;
-        if (instanceCount > 0) { if (geometry === 1) renderPass.drawIndexed(instanceCount * 6, 1, firstInstance * 6, 0, nSolid); else if (geometry) renderPass.drawIndexed(geometry.ib.length, instanceCount, geometry.i0, geometry.v0, firstInstance); else renderPass.draw(verticesPerInstance, instanceCount, 0, firstInstance); }
+
+      if (isVisible) {
+        if (visibleRunStart < 0) visibleRunStart = cellIndex;
+      } else if (visibleRunStart >= 0) {
+        const firstInstance = cellOffsets[visibleRunStart];
+        const instanceCount = cellOffsets[cellIndex] - firstInstance;
+        if (instanceCount > 0) {
+          if (geometry === 1) {
+            // Terrain quads have six indices each.
+            renderPass.drawIndexed(instanceCount * 6, 1, firstInstance * 6, 0, nSolid);
+          } else if (geometry) {
+            // Indexed, instanced rock/coral geometry.
+            renderPass.drawIndexed(geometry.ib.length, instanceCount, geometry.i0, geometry.v0, firstInstance);
+          } else {
+            // Vertex shader expands plant blades or screen-facing sprites.
+            renderPass.draw(verticesPerInstance, instanceCount, 0, firstInstance);
+          }
+        }
         visibleRunStart = -1;
       }
     }
   }
 }
+
 // Encode water, opaque/transparent scene, rays, blur, bloom and final output.
 // GPU commands are recorded here, then submitted as a single command buffer.
 function render() {
@@ -535,7 +587,14 @@ function render() {
 // CS[j] = distance to the rock (metres, < 0 in water) at the camera + CE[3j..3j+2]: the camera, then ±0.375 m on
 // each axis for the gradient
 const CE = new Float64Array([0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375]), CS = new Float64Array(7);
-const cv = (x, y, z) => { const b = CI[(x >> 2) + CN * ((y >> 2) + NY / 4 * (z >> 2))]; return b > 1 ? CG[b * 64 - 128 + (x & 3) + 4 * (y & 3) + 16 * (z & 3)] : b * 254 - 127; };
+// CI contains either a uniform-brick marker (0 water, 1 rock) or an
+// index (>=2) into the packed 4×4×4 signed-distance bricks in CG.
+function readCollisionVoxel(x, y, z) {
+  const brick = CI[(x >> 2) + CN * ((y >> 2) + (NY / 4) * (z >> 2))];
+  if (brick <= 1) return brick * 254 - 127;
+  const withinBrick = (x & 3) + 4 * (y & 3) + 16 * (z & 3);
+  return CG[(brick - 2) * 64 + withinBrick];
+}
 // Trilinearly interpolate the compact 4×4×4 collision bricks.
 // Result is positive inside rock and negative in open water.
 function sampleRockDistance(j) {
