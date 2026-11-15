@@ -126,24 +126,95 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   const nearPresetViewpoint = (x, z, r = 3) => { for (const p of POSES) if (hypot(x - p[0], z - p[2]) < r) return true; return false; };
   // --- kelp columns
   // CPU code packs blade parameters; WGSL creates and animates the actual blade vertices.
-  const addKelpColumn = (x, y, z, H, kind, dens = 1) => {
-    const strands = 2 + (random01() < 0.6) + (random01() < 0.3), ph = random01() * TAU, tw = randomRange(0.1, 0.28), sr = randomRange(0.2, 0.55), sc = randomRange(0.75, 1.25);
-    const la = random01() * TAU, lm = randomRange(0, 0.11), full = randomRange(0.55, 1.3) * dens;
-    const stem = (s, h) => { const a = ph + s * TAU / strands + h * tw, r = sr * (1 - 0.6 * h / H), ln = lm * h * h / H; return [x + cos(a) * r + cos(la) * ln, z + sin(a) * r + sin(la) * ln, a]; };
-    for (let s = 0; s < strands; s++) for (let h = 0; h < H - 1; h += 1.7) { const p = stem(s, h); addLeaf(big, p[0], y + h, p[1], 2.1, p[2] + PI / 2, 0.1, 0.17, h, 1, random01(), random01(), 0.3); }
-    const n = floor(H * 30 * full);
-    for (let i = 0; i < n; i++) {
-      const t = pow(random01(), 0.9), h = t * H, p = stem((random01() * strands) | 0, h);
-      const L = ((0.55 + 0.75 * random01() * random01()) * (1 - 0.5 * t * t) * sc + 0.25) * (kind === 1 ? 1.25 : 1.15);
-      const tilt = mix(randomRange(0.4, 1.0), randomRange(0.15, 0.45), t);
-      const type = kind === 1 ? (random01() < 0.8 ? 3 : 4) : kind === 2 ? (random01() < 0.5 ? 4 : 0) : 0;
-      addLeaf(big, p[0], y + h, p[1], L, random01() * TAU, tilt, L * (kind === 1 ? randomRange(0.09, 0.13) : randomRange(0.15, 0.21)) + 0.03, h, type, random01(), random01(), randomRange(0.38, 0.95));
+  // Build several winding kelp strands. Both central stems and attached blades
+  // are packed as instances; their bend is applied later by the vertex shader.
+  const addKelpColumn = (x, y, z, height, kind, density = 1) => {
+    const strandCount = 2 + (random01() < 0.6) + (random01() < 0.3);
+    const startingAngle = random01() * TAU;
+    const twistRate = randomRange(0.1, 0.28);
+    const stemRadius = randomRange(0.2, 0.55);
+    const widthVariation = randomRange(0.75, 1.25);
+    const leanDirection = random01() * TAU;
+    const leanAmount = randomRange(0, 0.11);
+    const fullness = randomRange(0.55, 1.3) * density;
+
+    // A stem's path bends and gently spirals upward.
+    // Returns world X/Z and the local angle at a height along a strand.
+    const stemPosition = (strandIndex, stemHeight) => {
+      const angle = startingAngle + strandIndex * TAU / strandCount + stemHeight * twistRate;
+      const radius = stemRadius * (1 - 0.6 * stemHeight / height);
+      const lean = leanAmount * stemHeight * stemHeight / height;
+      return [
+        x + cos(angle) * radius + cos(leanDirection) * lean,
+        z + sin(angle) * radius + sin(leanDirection) * lean,
+        angle,
+      ];
+    };
+
+    // Type 1 is the narrow structural stem, always present even on Low.
+    for (let strand = 0; strand < strandCount; strand++) {
+      for (let stemHeight = 0; stemHeight < height - 1; stemHeight += 1.7) {
+        const position = stemPosition(strand, stemHeight);
+        addLeaf(big, position[0], y + stemHeight, position[1], 2.1,
+          position[2] + PI / 2, 0.1, 0.17, stemHeight,
+          1, random01(), random01(), 0.3);
+      }
     }
-    for (let i = floor(H * (kind === 1 ? 16 : 13)); i > 0; i--) { const h = random01() * H, a = random01() * TAU, r = randomRange(0.15, 0.8) * (1 - 0.5 * h / H), ln = lm * h * h / H; addGlint(x + cos(a) * r + cos(la) * ln, y + h, z + sin(a) * r + sin(la) * ln, h, random01(), kind === 1 ? random01() : random01() * 0.6, randomRange(0.018, 0.05), 0); }
-    // light absorption footprint for the skylight bake
-    const hx = round((x - OX) / VS / 2), hz = round((z - OZ) / VS / 2);
-    for (let hy = floor((y - OY) / VS / 2); hy <= floor((y + H - OY) / VS / 2); hy++) {
-      if (hy >= 0 && hy < NY / 2 && hx > 0 && hx < NX / 2 - 1 && hz > 0 && hz < NZ / 2 - 1) kelpAbs[hx + NX / 2 * (hy + NY / 2 * hz)] += 0.17;
+
+    // Decorate each stem with broad blades. Blade type, width and bend vary
+    // independently, but the seeded random sequence is deterministic.
+    const bladeCount = floor(height * 30 * fullness);
+    for (let blade = 0; blade < bladeCount; blade++) {
+      const heightFraction = pow(random01(), 0.9);
+      const stemHeight = heightFraction * height;
+      const position = stemPosition((random01() * strandCount) | 0, stemHeight);
+      const bladeLength = (
+        (0.55 + 0.75 * random01() * random01())
+        * (1 - 0.5 * heightFraction * heightFraction) * widthVariation + 0.25
+      ) * (kind === 1 ? 1.25 : 1.15);
+      const tilt = mix(randomRange(0.4, 1.0), randomRange(0.15, 0.45), heightFraction);
+      const type = kind === 1
+        ? (random01() < 0.8 ? 3 : 4)
+        : kind === 2 ? (random01() < 0.5 ? 4 : 0) : 0;
+      const width = bladeLength * (
+        kind === 1 ? randomRange(0.09, 0.13) : randomRange(0.15, 0.21)
+      ) + 0.03;
+      addLeaf(big, position[0], y + stemHeight, position[1],
+        bladeLength, random01() * TAU, tilt, width,
+        stemHeight, type, random01(), random01(), randomRange(0.38, 0.95));
+    }
+
+    // Little specular particles scattered along the kelp, drawn additively.
+    for (let i = floor(height * (kind === 1 ? 16 : 13)); i > 0; i--) {
+      const stemHeight = random01() * height;
+      const angle = random01() * TAU;
+      const radius = randomRange(0.15, 0.8) * (1 - 0.5 * stemHeight / height);
+      const lean = leanAmount * stemHeight * stemHeight / height;
+      addGlint(
+        x + cos(angle) * radius + cos(leanDirection) * lean,
+        y + stemHeight,
+        z + sin(angle) * radius + sin(leanDirection) * lean,
+        stemHeight, random01(),
+        kind === 1 ? random01() : random01() * 0.6,
+        randomRange(0.018, 0.05), 0
+      );
+    }
+
+    // This low-resolution 3D footprint approximates light absorption by kelp
+    // during the one-time skylight/volumetric lookup bake.
+    const volumeX = round((x - OX) / VS / 2);
+    const volumeZ = round((z - OZ) / VS / 2);
+    const firstY = floor((y - OY) / VS / 2);
+    const lastY = floor((y + height - OY) / VS / 2);
+    for (let volumeY = firstY; volumeY <= lastY; volumeY++) {
+      const insideVolume =
+        volumeY >= 0 && volumeY < NY / 2 &&
+        volumeX > 0 && volumeX < NX / 2 - 1 &&
+        volumeZ > 0 && volumeZ < NZ / 2 - 1;
+      if (insideVolume) {
+        const volumeIndex = volumeX + (NX / 2) * (volumeY + (NY / 2) * volumeZ);
+        kelpAbs[volumeIndex] += 0.17;
+      }
     }
   };
   const KELP_REGIONS = [[-32, -5, 13, 0.85], [0, -86, 46, 1], [72, -26, 27, 0.9], [-60, -4, 11, 0.8], [0, -36, 12, 0.55], [-17, -8, 6, 0.8], [15, -8, 6, 0.8], [-4, 120, 20, 0.4], [-45, -63, 15, 0.9], [62, -26, 12, 0.9], [-100, 70, 30, 0.8], [100, 60, 30, 0.8], [-95, -90, 32, 0.8], [105, -85, 30, 0.7]];
