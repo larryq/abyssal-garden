@@ -601,29 +601,87 @@ function readCollisionVoxel(x, y, z) {
 }
 // Trilinearly interpolate the compact 4×4×4 collision bricks.
 // Result is positive inside rock and negative in open water.
-function sampleRockDistance(j) {
-  const x = (F[CX] + collisionSampleOffsets[j * 3] - OX) / VS - collisionGridOffset, y = (F[CY] + collisionSampleOffsets[j * 3 + 1] - OY) / VS, z = (F[CZ] + collisionSampleOffsets[j * 3 + 2] - OZ) / VS - collisionGridOffset;
-  const ix = x | 0, iy = y | 0, iz = z | 0, u = x - ix, v = y - iy, a = readCollisionVoxel(ix, iy, iz), b = readCollisionVoxel(ix, iy + 1, iz), c = readCollisionVoxel(ix, iy, iz + 1), d = readCollisionVoxel(ix, iy + 1, iz + 1);
-  const p = a + (readCollisionVoxel(ix + 1, iy, iz) - a) * u, q = b + (readCollisionVoxel(ix + 1, iy + 1, iz) - b) * u, r = c + (readCollisionVoxel(ix + 1, iy, iz + 1) - c) * u, s = d + (readCollisionVoxel(ix + 1, iy + 1, iz + 1) - d) * u;
-  const e = p + (q - p) * v; collisionSampleValues[j] = (e + (r + (s - r) * v - e) * (z - iz)) / 127;
+function sampleRockDistance(sampleIndex) {
+  // Convert from world-space metres to the cropped collision volume.
+  const voxelX =
+    (F[CX] + collisionSampleOffsets[sampleIndex * 3] - OX) / VS - collisionGridOffset;
+  const voxelY =
+    (F[CY] + collisionSampleOffsets[sampleIndex * 3 + 1] - OY) / VS;
+  const voxelZ =
+    (F[CZ] + collisionSampleOffsets[sampleIndex * 3 + 2] - OZ) / VS - collisionGridOffset;
+
+  const ix = voxelX | 0, iy = voxelY | 0, iz = voxelZ | 0;
+  const fractionX = voxelX - ix;
+  const fractionY = voxelY - iy;
+
+  // Sample the eight corners of this voxel cube and interpolate X, Y, Z.
+  const bottom00 = readCollisionVoxel(ix, iy, iz);
+  const top00 = readCollisionVoxel(ix, iy + 1, iz);
+  const bottom01 = readCollisionVoxel(ix, iy, iz + 1);
+  const top01 = readCollisionVoxel(ix, iy + 1, iz + 1);
+
+  const bottomX0 = bottom00
+    + (readCollisionVoxel(ix + 1, iy, iz) - bottom00) * fractionX;
+  const topX0 = top00
+    + (readCollisionVoxel(ix + 1, iy + 1, iz) - top00) * fractionX;
+  const bottomX1 = bottom01
+    + (readCollisionVoxel(ix + 1, iy, iz + 1) - bottom01) * fractionX;
+  const topX1 = top01
+    + (readCollisionVoxel(ix + 1, iy + 1, iz + 1) - top01) * fractionX;
+
+  const interpolatedY0 = bottomX0 + (topX0 - bottomX0) * fractionY;
+  const interpolatedY1 = bottomX1 + (topX1 - bottomX1) * fractionY;
+  const distance = interpolatedY0
+    + (interpolatedY1 - interpolatedY0) * (voxelZ - iz);
+  collisionSampleValues[sampleIndex] = distance / 127;
 }
-// Moves the camera by F[MX..MZ] in steps shorter than its radius cameraCollisionRadius (so it can't pass through thin rock), pushing it
-// back out after each step and dropping velocity into the rock, so it slides along.
+
+// Keep the swimmer outside solid geometry without disabling fluid motion.
+// Probe the center and small axis offsets to estimate the surface normal.
 const cameraCollisionRadius = 0.5;
-// Small substeps prevent tunneling; project velocity onto the tangent plane
-// when pushing out of rock, so the camera slides rather than sticking.
 function resolveCameraCollisions() {
-  const n = floor(sqrt(F[MX] * F[MX] + F[MY] * F[MY] + F[MZ] * F[MZ]) / 0.4) + 1;
-  for (let i = 0; i < n; i++) {
-    F[CX] += F[MX] / n; F[CY] += F[MY] / n; F[CZ] += F[MZ] / n;
-    for (let k = 0; k < 2; k++) {
-      sampleRockDistance(0); const s = collisionSampleValues[0] + cameraCollisionRadius; if (s <= 0) break;
-      for (let j = 1; j < 7; j++) sampleRockDistance(j);
-      let gx = collisionSampleValues[1] - collisionSampleValues[2], gy = collisionSampleValues[3] - collisionSampleValues[4], gz = collisionSampleValues[5] - collisionSampleValues[6]; const l = sqrt(gx * gx + gy * gy + gz * gz);
-      if (l < 0.075) break; // flat: deep in rock
-      gx /= l; gy /= l; gz /= l; const vn = F[VX] * gx + F[VY] * gy + F[VZ] * gz;
-      F[CX] -= gx * s; F[CY] -= gy * s; F[CZ] -= gz * s;
-      if (vn > 0) { F[VX] -= gx * vn; F[VY] -= gy * vn; F[VZ] -= gz * vn; }
+  const movementDistance = sqrt(
+    F[MX] * F[MX] + F[MY] * F[MY] + F[MZ] * F[MZ]
+  );
+  const substepCount = floor(movementDistance / 0.4) + 1;
+
+  for (let step = 0; step < substepCount; step++) {
+    F[CX] += F[MX] / substepCount;
+    F[CY] += F[MY] / substepCount;
+    F[CZ] += F[MZ] / substepCount;
+
+    // A second projection helps at corners or intersecting rock surfaces.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      sampleRockDistance(0);
+      const penetration = collisionSampleValues[0] + cameraCollisionRadius;
+      if (penetration <= 0) break;
+
+      for (let sample = 1; sample < 7; sample++) sampleRockDistance(sample);
+      let normalX = collisionSampleValues[1] - collisionSampleValues[2];
+      let normalY = collisionSampleValues[3] - collisionSampleValues[4];
+      let normalZ = collisionSampleValues[5] - collisionSampleValues[6];
+      const normalLength = sqrt(
+        normalX * normalX + normalY * normalY + normalZ * normalZ
+      );
+      if (normalLength < 0.075) break; // Gradient is flat deep inside a rock.
+
+      normalX /= normalLength;
+      normalY /= normalLength;
+      normalZ /= normalLength;
+      const velocityIntoRock =
+        F[VX] * normalX + F[VY] * normalY + F[VZ] * normalZ;
+
+      F[CX] -= normalX * penetration;
+      F[CY] -= normalY * penetration;
+      F[CZ] -= normalZ * penetration;
+
+      // Remove only the component directed into the rock surface, retaining
+      // tangential velocity so swimming along a cave wall feels natural.
+      if (velocityIntoRock > 0) {
+        F[VX] -= normalX * velocityIntoRock;
+        F[VY] -= normalY * velocityIntoRock;
+        F[VZ] -= normalZ * velocityIntoRock;
+      }
     }
   }
 }
