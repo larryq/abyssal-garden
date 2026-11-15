@@ -626,53 +626,160 @@ function resolveCameraCollisions() {
 
 // CPU-side animation and input. Keep simulation dt <= 100 ms after tab pauses.
 // Rendering quality changes use separate slower windows to avoid oscillation.
+// Adapt render load using GPU timestamps when available, otherwise frame times.
+// To avoid oscillation, first adjust pixels, then draw distance, then pixels again.
+function updateAdaptiveQuality(frameDurationMs) {
+  if (frameDurationMs >= 1000) return;
+  dynT += frameDurationMs;
+  if (dynT <= 0) return;
+
+  dynN++;
+  if (dynT <= (menu ? 400 : 1000)) return;
+
+  const averageFrameMs = dynT / dynN;
+  const averageGpuMs = dynGN ? dynG / dynGN : 0;
+  let loadFactor = 1;
+
+  if (averageGpuMs) {
+    // Keep measured GPU time near the middle of the 9.8–13.6 ms band.
+    if (averageGpuMs > 13.6 || averageGpuMs < 9.8) {
+      loadFactor = 11.7 / averageGpuMs;
+    }
+  } else if (averageFrameMs > 17.6) {
+    // Without GPU timings, require two slow windows before scaling down.
+    dynOk = 0;
+    if (++dynBad > 1) {
+      loadFactor = 15 / averageFrameMs;
+      dynBad = 0;
+      dynWait = min(dynWait * 2, 60);
+    }
+  } else {
+    dynBad = 0;
+    if (averageFrameMs < 12.5) {
+      loadFactor = 15 / averageFrameMs;
+    } else if (++dynOk > dynWait) {
+      // Test for headroom occasionally when vsync hides real GPU capacity.
+      loadFactor = 1.17;
+      dynOk = 0;
+    }
+  }
+
+  loadFactor = clamp(loadFactor, 0.5, 1.7);
+  const maximumPixels = min(PIXMAX, DW * DH);
+  const middlePixels = max(maximumPixels / 2, PIXMIN);
+  const previousSettings = pix + det;
+
+  const shouldAdjustPixels = loadFactor < 1
+    ? pix > middlePixels || det <= DETMIN
+    : pix < middlePixels || det >= 1;
+
+  if (shouldAdjustPixels) {
+    const pixelLimit = loadFactor < 1
+      ? (det > DETMIN ? middlePixels : PIXMIN)
+      : (det < 1 ? middlePixels : maximumPixels);
+    pix *= loadFactor;
+    if (loadFactor < 1 ? pix < pixelLimit : pix > pixelLimit) {
+      pix = pixelLimit;
+    }
+  } else {
+    det = clamp(det * sqrt(loadFactor), DETMIN, 1);
+  }
+
+  if (previousSettings !== pix + det) {
+    keep('abyssal', [LV, pix < maximumPixels ? pix | 0 : '', det]);
+  }
+  dynN = dynT = dynG = dynGN = 0;
+  resize();
+}
+
+// Smooth first-person swimming with mouse/touch look and collision.
+function updateCameraMovement(dt) {
+  // Touch acts like a virtual joystick held off-center.
+  if (tId >= 0) {
+    const touchScale = 4 / min(innerWidth, innerHeight);
+    let stickX = clamp((tx - tx0) * touchScale, -1, 1);
+    let stickY = clamp((ty - ty0) * touchScale, -1, 1);
+    lkx += stickX * 1.5 * dt;
+    lky += stickY * dt;
+  }
+
+  // Two cascaded low-pass filters make mouse look fluid and avoid abrupt turns.
+  const smoothing = 1 - exp(-dt * 30);
+  lkx += mdx * 0.0022;
+  lky += mdy * 0.0022;
+  mdx = 0;
+  mdy = 0;
+
+  const firstYaw = lkx * smoothing;
+  const firstPitch = lky * smoothing;
+  lkx -= firstYaw;
+  lky -= firstPitch;
+  l2x += firstYaw;
+  l2y += firstPitch;
+
+  const yawDelta = l2x * smoothing;
+  const pitchDelta = l2y * smoothing;
+  l2x -= yawDelta;
+  l2y -= pitchDelta;
+
+  const yaw = F[YAW] + yawDelta;
+  const pitch = clamp(F[PIT] - pitchDelta, -1.55, 1.55);
+  const swimSpeed = ks || tN > 1 ? 26 : 7;
+  const acceleration = 1 - exp(-dt * 4.5);
+  const forwardInput = tId >= 0 ? 0.7 : kf - kb;
+  const sidewaysInput = kr - kl;
+  const verticalInput = ku - kd;
+  const pitchCos = cos(pitch);
+  const yawSin = sin(yaw);
+  const yawCos = cos(yaw);
+
+  // Desired movement in world coordinates; ease velocity toward that target.
+  const desiredX = (yawSin * pitchCos * forwardInput + yawCos * sidewaysInput) * swimSpeed;
+  const desiredY = (sin(pitch) * forwardInput + verticalInput) * swimSpeed;
+  const desiredZ = (-yawCos * pitchCos * forwardInput + yawSin * sidewaysInput) * swimSpeed;
+  const velocityX = F[VX] + (desiredX - F[VX]) * acceleration;
+  const velocityY = F[VY] + (desiredY - F[VY]) * acceleration;
+  const velocityZ = F[VZ] + (desiredZ - F[VZ]) * acceleration;
+
+  let nextX = F[CX] + velocityX * dt;
+  let nextY = F[CY] + velocityY * dt;
+  let nextZ = F[CZ] + velocityZ * dt;
+
+  // Keep the swimmer inside the authored world and below the surface.
+  const radialDistance = sqrt(nextX * nextX + nextZ * nextZ);
+  if (radialDistance > 150) {
+    nextX *= 150 / radialDistance;
+    nextZ *= 150 / radialDistance;
+  }
+  nextY = clamp(nextY, -52, -1.2);
+
+  F[YAW] = yaw;
+  F[PIT] = pitch;
+  F[VX] = velocityX;
+  F[VY] = velocityY;
+  F[VZ] = velocityZ;
+  F[MX] = nextX - F[CX];
+  F[MY] = nextY - F[CY];
+  F[MZ] = nextZ - F[CZ];
+  resolveCameraCollisions();
+}
+
+// The browser's frame timestamp is milliseconds; the simulation uses seconds.
+// Clamp long pauses so returning to the tab cannot leap through the terrain.
 function frame(now) {
   requestAnimationFrame(frame);
-  const dtr = now - F[LAST]; F[LAST] = now;
-  let dt = dtr / 1000; if (dt > 0.1) dt = 0.1;
-  // Dynamic resolution for 60 fps: every second (0.4 s behind the menu) scale the load by k
-  if (dtr < 1e3 && (dynT += dtr) > 0 && (dynN++, dynT > (menu ? 400 : 1000))) {
-    const a = dynT / dynN, g = dynGN ? dynG / dynGN : 0; let k = 1;
-    // with GPU timing: keep it between 9.8 and 13.6 ms
-    if (g) { if (g > 13.6 || g < 9.8) k = 11.7 / g; }
-    // without: slow for two periods in a row means fewer pixels, and twice as long before trying to go back up
-    else if (a > 17.6) { dynOk = 0; if (++dynBad > 1) { k = 15 / a; dynBad = 0; dynWait = min(dynWait * 2, 60); } }
-    // at the display's rate there is no telling if there is room, so try a little more now and then
-    else { dynBad = 0; if (a < 12.5) k = 15 / a; else if (++dynOk > dynWait) { k = 1.17; dynOk = 0; } }
-    k = k < 0.5 ? 0.5 : k > 1.7 ? 1.7 : k; const top = min(PIXMAX, DW * DH), mid = max(top / 2, PIXMIN), was = pix + det;
-    // too slow: pixels down to `mid` first, then draw distance, then the remaining pixels; faster goes back the same way
-    if (k < 1 ? pix > mid || det <= DETMIN : pix < mid || det >= 1) {
-      const end = k < 1 ? (det > DETMIN ? mid : PIXMIN) : det < 1 ? mid : top;
-      pix *= k; if (k < 1 ? pix < end : pix > end) pix = end;
-    } else { det *= sqrt(k); det = det < DETMIN ? DETMIN : det > 1 ? 1 : det; }
-    if (was !== pix + det) keep('abyssal', [LV, pix < top ? pix | 0 : '', det]); // nothing kept at full resolution
-    dynN = dynT = dynG = dynGN = 0; resize();
-  }
+  const frameDurationMs = now - F[LAST];
+  F[LAST] = now;
+  const dt = min(frameDurationMs / 1000, 0.1);
+
+  updateAdaptiveQuality(frameDurationMs);
   F[TIME] += dt;
-  {
-    // touch: holding the finger away from where it went down keeps turning, like a joystick
-    if (tId >= 0) {
-      const tr = 4 / (innerWidth < innerHeight ? innerWidth : innerHeight); let jx = (tx - tx0) * tr, jy = (ty - ty0) * tr;
-      jx = jx > 1 ? 1 : jx < -1 ? -1 : jx; jy = jy > 1 ? 1 : jy < -1 ? -1 : jy;
-      lkx += jx * 1.5 * dt; lky += jy * dt;
-    }
-    // mouse look through two cascaded low-pass stages
-    const kq = 1 - exp(-dt * 30); lkx += mdx * 0.0022; lky += mdy * 0.0022; mdx = 0; mdy = 0;
-    const ax = lkx * kq, ay = lky * kq; lkx -= ax; lky -= ay; l2x += ax; l2y += ay;
-    const dyw = l2x * kq, dpt = l2y * kq; l2x -= dyw; l2y -= dpt;
-    const yaw = F[YAW] + dyw; let pitch = F[PIT] - dpt; pitch = pitch < -1.55 ? -1.55 : pitch > 1.55 ? 1.55 : pitch;
-    const sp = ks || tN > 1 ? 26 : 7, k = 1 - exp(-dt * 4.5), mf = tId >= 0 ? 0.7 : kf - kb, mr = kr - kl, mu = ku - kd, cp = cos(pitch), sy = sin(yaw), cw = cos(yaw);
-    const vx = F[VX] + ((sy * cp * mf + cw * mr) * sp - F[VX]) * k, vy = F[VY] + ((sin(pitch) * mf + mu) * sp - F[VY]) * k, vz = F[VZ] + ((-cw * cp * mf + sy * mr) * sp - F[VZ]) * k;
-    let x = F[CX] + vx * dt, y = F[CY] + vy * dt, z = F[CZ] + vz * dt;
-    const rad = sqrt(x * x + z * z); if (rad > 150) { x *= 150 / rad; z *= 150 / rad; }
-    y = y < -52 ? -52 : y > -1.2 ? -1.2 : y;
-    F[YAW] = yaw; F[PIT] = pitch; F[VX] = vx; F[VY] = vy; F[VZ] = vz; F[MX] = x - F[CX]; F[MY] = y - F[CY]; F[MZ] = z - F[CZ];
-    resolveCameraCollisions();
-  }
+  updateCameraMovement(dt);
   render();
+
   if (hud) {
-    hN++; if (dtr > hMax) hMax = dtr; if (dtr < hMin) hMin = dtr; if (dtr > hPer * 1.5) { hLate++; hTot++; }
-    F[HUDT] += dtr / 1000;
+    hN++; if (frameDurationMs > hMax) hMax = frameDurationMs; if (frameDurationMs < hMin) hMin = frameDurationMs; if (frameDurationMs > hPer * 1.5) { hLate++; hTot++; }
+    F[HUDT] += frameDurationMs / 1000;
     if (F[HUDT] > 0.5) { info.textContent = `${(hN / F[HUDT]).toFixed(0)} fps  ·  worst frame ${hMax.toFixed(1)} ms  ·  late frames ${hLate} (total ${hTot})  ·  GPU ${F[GPU].toFixed(2)} ms  ·  ${W}x${H} (${W * 100 / DW | 0}%)`; F[HUDT] = 0; hPer = hMin; hN = 0; hMax = 0; hMin = 1e9; hLate = 0; }
   }
 }
