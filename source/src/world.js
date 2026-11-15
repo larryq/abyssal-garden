@@ -6,9 +6,12 @@
 // to see how meshes, plants, animals and instances are constructed.
 
 // ---------------------------------------------------------------- terrain mesh from the density grid
-function buildTerrain(D) {
-  const sn = surfaceNets(D, NX, NY, NZ), nv = sn.nv, gp = sn.pos;
-  const smp = sampler3(D, NX, NY, NZ);
+// Convert the GPU-produced density volume to a triangle mesh using surface nets.
+// Keep world-space positions/normals for vegetation placement before uploading the
+// tightly packed 16-byte vertex format (xyz float32 + four signed normalized bytes).
+function extractTerrainMesh(D) {
+  const sn = extractSurfaceNets(D, NX, NY, NZ), nv = sn.nv, gp = sn.pos;
+  const smp = createTrilinearSampler(D, NX, NY, NZ);
   const vb = new ArrayBuffer(nv * 16), vf = new Float32Array(vb), v8 = new Int8Array(vb);
   const wp = new Float32Array(nv * 3), wn = new Float32Array(nv * 3);
   for (let k = 0; k < nv; k++) {
@@ -36,26 +39,53 @@ function buildTerrain(D) {
 }
 
 // ---------------------------------------------------------------- instance stores
-function makeWorld(D, T, flyPts, POSES) {
+// Build the complete static world once at startup. Generated leaves, stones,
+// coral and wildlife are grouped into spatial cells for inexpensive instancing.
+// The seeded random streams keep separate content families reproducible.
+function populateProceduralWorld(D, T, flyPts, POSES) {
   const gi = (x, y, z) => x + NX * (y + NY * z);
   const smp = T.smp;
   const Dw = (x, y, z) => smp((x - OX) / VS, (y - OY) / VS, (z - OZ) / VS);
   const nCells = CELLS * CELLS;
+  // 16×16 X/Z grid: instance groups are culled and drawn in whole-cell runs.
   const cellOf = (x, z) => clamp(floor((x - OX) / CELLW), 0, CELLS - 1) + CELLS * clamp(floor((z - OZ) / CELLW), 0, CELLS - 1);
   const big = Array.from({ length: nCells }, () => []), small = Array.from({ length: nCells }, () => []);
-  // Medium and Low keep every 2nd / 4th leaf (but every kelp stem), made wider; the random stream is the same
+  // Medium and Low keep every 2nd / 4th addLeaf (but every kelp stem), made wider; the random stream is the same
   let nth = 0;
-  const leaf = (L, x, y, z, len, yaw, tilt, wid, hA, type, s1, s2, bend) => { if (type === 1 || !(nth++ % THIN)) L[cellOf(x, z)].push(x, y, z, len, yaw, tilt, type === 1 ? wid : wid * (1 + LV / 2), hA, type, s1, s2, bend); };
+  // Packed addLeaf layout: position (3), length, yaw, tilt, width, stem height,
+  // plant type, two animation seeds and bend amplitude (12 floats total).
+  // Stems (type 1) are never thinned; other blades are thinned by quality level.
+  const addLeaf = (cells, x, y, z, length, yaw, tilt, width, stemHeight, type, seed1, seed2, bend) => {
+    if (type !== 1 && (nth++ % THIN)) return;
+    cells[cellOf(x, z)].push(
+      x, y, z, length, yaw, tilt,
+      type === 1 ? width : width * (1 + LV / 2),
+      stemHeight, type, seed1, seed2, bend
+    );
+  };
   const glint = (...a) => { nth++ % THIN || glints.push(...a); };
   const solids = []; // per mesh id: arrays of 12 floats
   const props = Array.from({ length: 6 }, () => Array.from({ length: nCells }, () => []));
-  const solid = (mesh, x, y, z, sc, q, mat, seed, ts = 1, bob = 0) => { (mesh > 3 && mesh < 10 ? props[mesh - 4][cellOf(x, z)] : (solids[mesh] ||= [])).push(x, y, z, sc, q[0], q[1], q[2], q[3], mat, seed, ts, bob); };
+  // Each addSolidInstance instance is twelve floats: position, scale, quaternion (xyzw),
+  // material ID, random seed, animation speed and bobbing amplitude.
+  const addSolidInstance = (mesh, x, y, z, scale, orientation, material, seed, timeScale = 1, bob = 0) => {
+    const store = mesh > 3 && mesh < 10
+      ? props[mesh - 4][cellOf(x, z)]
+      : (solids[mesh] ||= []);
+    store.push(
+      x, y, z, scale,
+      orientation[0], orientation[1], orientation[2], orientation[3],
+      material, seed, timeScale, bob
+    );
+  };
   const chunks = Array.from({ length: NCHUNK }, () => Array.from({ length: nCells }, () => []));
   const glints = [];
   const rel = (i, f, r) => { const p = POSES[i]; let fx = p[3] - p[0], fz = p[5] - p[2]; const l = hypot(fx, fz); fx /= l; fz /= l; return [p[0] + fx * f - fz * r, p[2] + fz * f + fx * r]; };
   const bubbles = [], kelpAbs = new Float32Array((NX / 2) * (NY / 2) * (NZ / 2));
 
   // --- surface queries
+  // Density is positive in rock. Sampling and gradients place plants against
+  // the true canyon/overhang surface rather than an approximate heightmap.
   const fl = [];
   const floorsAt = (x, z) => {
     const ix = clamp(round((x - OX) / VS), 1, NX - 2), iz = clamp(round((z - OZ) / VS), 1, NZ - 2);
@@ -81,25 +111,25 @@ function makeWorld(D, T, flyPts, POSES) {
     }
     return null;
   };
-  const pickV = () => ((rnd() * T.nv) | 0) * 3;
+  const pickV = () => ((random01() * T.nv) | 0) * 3;
   const tangent = (n) => { let t = abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [1, 0, 0]; const l = hypot(...t); t = t.map((v) => v / l); return [t, [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]]]; };
   const nearFly = (x, y, z, r) => { for (const p of flyPts) if (hypot(x - p[0], z - p[2]) < r && y < p[1] + 3 && y > p[1] - 13) return true; return false; };
   const nearPose = (x, z, r = 3) => { for (const p of POSES) if (hypot(x - p[0], z - p[2]) < r) return true; return false; };
   // --- kelp columns
   const column = (x, y, z, H, kind, dens = 1) => {
-    const strands = 2 + (rnd() < 0.6) + (rnd() < 0.3), ph = rnd() * TAU, tw = rr(0.1, 0.28), sr = rr(0.2, 0.55), sc = rr(0.75, 1.25);
-    const la = rnd() * TAU, lm = rr(0, 0.11), full = rr(0.55, 1.3) * dens;
+    const strands = 2 + (random01() < 0.6) + (random01() < 0.3), ph = random01() * TAU, tw = randomRange(0.1, 0.28), sr = randomRange(0.2, 0.55), sc = randomRange(0.75, 1.25);
+    const la = random01() * TAU, lm = randomRange(0, 0.11), full = randomRange(0.55, 1.3) * dens;
     const stem = (s, h) => { const a = ph + s * TAU / strands + h * tw, r = sr * (1 - 0.6 * h / H), ln = lm * h * h / H; return [x + cos(a) * r + cos(la) * ln, z + sin(a) * r + sin(la) * ln, a]; };
-    for (let s = 0; s < strands; s++) for (let h = 0; h < H - 1; h += 1.7) { const p = stem(s, h); leaf(big, p[0], y + h, p[1], 2.1, p[2] + PI / 2, 0.1, 0.17, h, 1, rnd(), rnd(), 0.3); }
+    for (let s = 0; s < strands; s++) for (let h = 0; h < H - 1; h += 1.7) { const p = stem(s, h); addLeaf(big, p[0], y + h, p[1], 2.1, p[2] + PI / 2, 0.1, 0.17, h, 1, random01(), random01(), 0.3); }
     const n = floor(H * 30 * full);
     for (let i = 0; i < n; i++) {
-      const t = pow(rnd(), 0.9), h = t * H, p = stem((rnd() * strands) | 0, h);
-      const L = ((0.55 + 0.75 * rnd() * rnd()) * (1 - 0.5 * t * t) * sc + 0.25) * (kind === 1 ? 1.25 : 1.15);
-      const tilt = mix(rr(0.4, 1.0), rr(0.15, 0.45), t);
-      const type = kind === 1 ? (rnd() < 0.8 ? 3 : 4) : kind === 2 ? (rnd() < 0.5 ? 4 : 0) : 0;
-      leaf(big, p[0], y + h, p[1], L, rnd() * TAU, tilt, L * (kind === 1 ? rr(0.09, 0.13) : rr(0.15, 0.21)) + 0.03, h, type, rnd(), rnd(), rr(0.38, 0.95));
+      const t = pow(random01(), 0.9), h = t * H, p = stem((random01() * strands) | 0, h);
+      const L = ((0.55 + 0.75 * random01() * random01()) * (1 - 0.5 * t * t) * sc + 0.25) * (kind === 1 ? 1.25 : 1.15);
+      const tilt = mix(randomRange(0.4, 1.0), randomRange(0.15, 0.45), t);
+      const type = kind === 1 ? (random01() < 0.8 ? 3 : 4) : kind === 2 ? (random01() < 0.5 ? 4 : 0) : 0;
+      addLeaf(big, p[0], y + h, p[1], L, random01() * TAU, tilt, L * (kind === 1 ? randomRange(0.09, 0.13) : randomRange(0.15, 0.21)) + 0.03, h, type, random01(), random01(), randomRange(0.38, 0.95));
     }
-    for (let i = floor(H * (kind === 1 ? 16 : 13)); i > 0; i--) { const h = rnd() * H, a = rnd() * TAU, r = rr(0.15, 0.8) * (1 - 0.5 * h / H), ln = lm * h * h / H; glint(x + cos(a) * r + cos(la) * ln, y + h, z + sin(a) * r + sin(la) * ln, h, rnd(), kind === 1 ? rnd() : rnd() * 0.6, rr(0.018, 0.05), 0); }
+    for (let i = floor(H * (kind === 1 ? 16 : 13)); i > 0; i--) { const h = random01() * H, a = random01() * TAU, r = randomRange(0.15, 0.8) * (1 - 0.5 * h / H), ln = lm * h * h / H; glint(x + cos(a) * r + cos(la) * ln, y + h, z + sin(a) * r + sin(la) * ln, h, random01(), kind === 1 ? random01() : random01() * 0.6, randomRange(0.018, 0.05), 0); }
     // light absorption footprint for the skylight bake
     const hx = round((x - OX) / VS / 2), hz = round((z - OZ) / VS / 2);
     for (let hy = floor((y - OY) / VS / 2); hy <= floor((y + H - OY) / VS / 2); hy++) {
@@ -115,18 +145,18 @@ function makeWorld(D, T, flyPts, POSES) {
     return d;
   };
   const occ = new Set();
-  rseed(1);
+  resetRandomSeed(1);
   const tryColumn = (x, z, kind, force, dens = 1) => {
     const key = floor(x / 2.3) * 4096 + floor(z / 2.3);
     if (occ.has(key)) return;
     const f = floorsAt(x, z); const c = [];
     for (let i = 0; i < f.length; i += 2) if (f[i + 1] > 9) c.push(i);
     if (!c.length) return;
-    const i = c[(rnd() * c.length) | 0], y = f[i];
+    const i = c[(random01() * c.length) | 0], y = f[i];
     if (grad(x, y, z)[1] < 0.55) return;
     if (!force && flyPts.some((p) => hypot(x - p[0], z - p[2]) < 5)) return;
     occ.add(key);
-    column(x, y - 0.3, z, min(f[i + 1] - rr(0.8, 5), force ? rr(30, 42) : rr(15, 40)), kind, dens);
+    column(x, y - 0.3, z, min(f[i + 1] - randomRange(0.8, 5), force ? randomRange(30, 42) : randomRange(15, 40)), kind, dens);
   };
   // hand-placed columns framing the viewpoints: x, z, kind, density
   for (const p of [[...rel(0, 11, -8.5), 0], [...rel(0, 16, -10.5), 0], [...rel(0, 21, -9), 0], [...rel(0, 9, 7), 0], [...rel(0, 14, 9.5), 0], [...rel(0, 19, 8), 0], [...rel(0, 26, 6), 0],
@@ -136,144 +166,144 @@ function makeWorld(D, T, flyPts, POSES) {
     [...rel(2, 6.5, -5.5), 0, 1.5], [...rel(2, 9.5, -8), 0, 1.3], [...rel(2, 8, 6), 0, 1.4], [...rel(2, 12, 3.6), 0, 1.3], [...rel(2, 17, -2.5), 0, 1.2], [...rel(2, 21, 4), 0, 1.2], [...rel(2, 12, -4.5), 2, 1.2], [...rel(2, 27, -9), 0, 1.2], [...rel(2, 30, 8.5), 0, 1.2], [...rel(2, 37, -3), 0, 1.1],
     [...rel(2, 13.5, 6.5), 0, 1.3], [...rel(2, 14.5, -7), 0, 1.3], [...rel(2, 6.5, 6.5), 0, 1.3], [...rel(2, 9, -8), 2, 1.3]]) tryColumn(p[0], p[1], p[2], true, p[3]);
   // random columns across the world
-  rseed(2);
+  resetRandomSeed(2);
   for (let i = 0; i < 15000; i++) {
-    const a = rnd() * TAU, r = sqrt(rnd()) * 170, x = cos(a) * r, z = sin(a) * r;
-    if (rnd() < kelpDens(x, z)) tryColumn(x, z, zoneP(x, z) > 0.5 && rnd() < 0.5 ? 1 : rnd() < 0.03 ? 2 : 0);
+    const a = random01() * TAU, r = sqrt(random01()) * 170, x = cos(a) * r, z = sin(a) * r;
+    if (random01() < kelpDens(x, z)) tryColumn(x, z, zoneP(x, z) > 0.5 && random01() < 0.5 ? 1 : random01() < 0.03 ? 2 : 0);
   }
 
   // --- clusters of ribbon leaves on the ground
   const cluster = (x, y, z, n, type, lmin, lmax, wmin, wmax, tmax, sway) => {
     for (let i = 0; i < n; i++) {
-      const a = rnd() * TAU, r = rnd() * 0.5, L = rr(lmin, lmax);
-      leaf(big, x + cos(a) * r, y - 0.15, z + sin(a) * r, L, a, rr(0.05, tmax), rr(wmin, wmax), sway, type, rnd(), rnd(), rr(0.3, 0.8));
+      const a = random01() * TAU, r = random01() * 0.5, L = randomRange(lmin, lmax);
+      addLeaf(big, x + cos(a) * r, y - 0.15, z + sin(a) * r, L, a, randomRange(0.05, tmax), randomRange(wmin, wmax), sway, type, random01(), random01(), randomRange(0.3, 0.8));
     }
   };
   const HOT = [[0, 5, 30], [42, 30, 24], [6, 82, 34], [-58, 10, 24], [4, -88, 30], [-36, 44, 18], [-46, -60, 20]];
   const hot = (x, z) => { let h = 0.4; for (const p of HOT) h = max(h, sstep(p[2], p[2] * 0.4, hypot(x - p[0], z - p[1]))); return h; };
-  rseed(3);
+  resetRandomSeed(3);
   for (let i = 0; i < 40000; i++) {
     const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
     if (hypot(x, z) > 172 || y > -6) continue;
-    const h = hot(x, z), zp = zoneP(x, z), u = rnd();
+    const h = hot(x, z), zp = zoneP(x, z), u = random01();
     if (nearFly(x, y, z, 4) || hypot(x + 1, z - 2) < 9 || nearPose(x, z, 8)) continue;
-    if (ny > 0.75 && u < 0.10 * h) cluster(x, y, z, 8 + rnd() * 14 | 0, 2, 1.0, 3.0, 0.13, 0.26, 0.6, 2.5);
-    else if (ny > 0.6 && u < 0.10 * h + 0.07 * max(zp, h * 0.4)) cluster(x, y, z, 10 + rnd() * 18 | 0, rnd() < 0.8 ? 3 : 4, 0.9, 2.6, 0.14, 0.28, 0.9, 1.5);
+    if (ny > 0.75 && u < 0.10 * h) cluster(x, y, z, 8 + random01() * 14 | 0, 2, 1.0, 3.0, 0.13, 0.26, 0.6, 2.5);
+    else if (ny > 0.6 && u < 0.10 * h + 0.07 * max(zp, h * 0.4)) cluster(x, y, z, 10 + random01() * 18 | 0, random01() < 0.8 ? 3 : 4, 0.9, 2.6, 0.14, 0.28, 0.9, 1.5);
     else if (ny < -0.35 && u < 0.5 * max(zp, 0.2)) { // hanging fronds
-      const n = 12 + rnd() * 20 | 0;
-      for (let j = 0; j < n; j++) leaf(big, x + rr(-0.6, 0.6), y + 0.2, z + rr(-0.6, 0.6), rr(0.8, 3.2), rnd() * TAU, PI - rr(0, 0.4), rr(0.08, 0.18), 0, zp > 0.3 || rnd() < 0.5 ? 6 : 0, rnd(), rnd(), rr(0.3, 0.6));
+      const n = 12 + random01() * 20 | 0;
+      for (let j = 0; j < n; j++) addLeaf(big, x + randomRange(-0.6, 0.6), y + 0.2, z + randomRange(-0.6, 0.6), randomRange(0.8, 3.2), random01() * TAU, PI - randomRange(0, 0.4), randomRange(0.08, 0.18), 0, zp > 0.3 || random01() < 0.5 ? 6 : 0, random01(), random01(), randomRange(0.3, 0.6));
     } else if (ny > -0.2 && ny < 0.8 && u < 0.07) { // wall tufts
-      const yaw = atan2(T.wn[k + 2], T.wn[k]), n = 5 + rnd() * 7 | 0;
-      for (let j = 0; j < n; j++) leaf(big, x, y, z, rr(0.5, 1.4), yaw + rr(-0.9, 0.9), rr(0.3, 1.1), rr(0.06, 0.12), 0.5, zp > 0.4 && rnd() < 0.6 ? 3 : 0, rnd(), rnd(), rr(0.2, 0.6));
+      const yaw = atan2(T.wn[k + 2], T.wn[k]), n = 5 + random01() * 7 | 0;
+      for (let j = 0; j < n; j++) addLeaf(big, x, y, z, randomRange(0.5, 1.4), yaw + randomRange(-0.9, 0.9), randomRange(0.3, 1.1), randomRange(0.06, 0.12), 0.5, zp > 0.4 && random01() < 0.6 ? 3 : 0, random01(), random01(), randomRange(0.2, 0.6));
     }
   }
   // --- ground cover: dense carpets of small tufts in the magenta patches
-  rseed(4);
+  resetRandomSeed(4);
   for (const p of MAGENTA) for (let i = p[2] * p[2] * PI * 45; i > 0; i--) {
-    const a = rnd() * TAU, r = sqrt(rnd()) * p[2], x = p[0] + cos(a) * r, z = p[1] + sin(a) * r;
-    if (rnd() > magAt(x, z) + 0.12 || nearPose(x, z)) continue;
+    const a = random01() * TAU, r = sqrt(random01()) * p[2], x = p[0] + cos(a) * r, z = p[1] + sin(a) * r;
+    if (random01() > magAt(x, z) + 0.12 || nearPose(x, z)) continue;
     const f = floorsAt(x, z); if (!f.length) continue;
     const y = f[f.length - 2]; if (grad(x, y, z)[1] < 0.7) continue;
-    const nl = 2 + (rnd() * 3 | 0), yw = rnd() * TAU;
-    for (let j = 0; j < nl; j++) leaf(small, x, y - 0.03, z, rr(0.08, 0.26), yw + j * TAU / nl + rr(-0.4, 0.4), rr(0.15, 0.85), rr(0.035, 0.07), 0, 5, rnd(), rnd(), rr(0.3, 0.7));
-    if (rnd() < 0.3) for (let j = 0; j < 2; j++) leaf(small, x + rr(-0.2, 0.2), y - 0.04, z + rr(-0.2, 0.2), rr(0.2, 0.55), rnd() * TAU, rr(0.05, 0.6), rr(0.03, 0.06), 0, 7, rnd(), rnd(), rr(0.3, 0.8));
-    if (rnd() < 0.3) glint(x, y + rr(0.08, 0.22), z, 0, rnd(), 0.82 + rnd() * 0.18, rr(0.01, 0.02), 0);
+    const nl = 2 + (random01() * 3 | 0), yw = random01() * TAU;
+    for (let j = 0; j < nl; j++) addLeaf(small, x, y - 0.03, z, randomRange(0.08, 0.26), yw + j * TAU / nl + randomRange(-0.4, 0.4), randomRange(0.15, 0.85), randomRange(0.035, 0.07), 0, 5, random01(), random01(), randomRange(0.3, 0.7));
+    if (random01() < 0.3) for (let j = 0; j < 2; j++) addLeaf(small, x + randomRange(-0.2, 0.2), y - 0.04, z + randomRange(-0.2, 0.2), randomRange(0.2, 0.55), random01() * TAU, randomRange(0.05, 0.6), randomRange(0.03, 0.06), 0, 7, random01(), random01(), randomRange(0.3, 0.8));
+    if (random01() < 0.3) glint(x, y + randomRange(0.08, 0.22), z, 0, random01(), 0.82 + random01() * 0.18, randomRange(0.01, 0.02), 0);
   }
-  rseed(5);
+  resetRandomSeed(5);
   for (let i = 0; i < 620000; i++) {
     const k = pickV(), ny = T.wn[k + 1];
     if (ny < 0.72) continue;
-    const x = T.wp[k] + rr(-0.45, 0.45), z = T.wp[k + 2] + rr(-0.45, 0.45), y = T.wp[k + 1];
+    const x = T.wp[k] + randomRange(-0.45, 0.45), z = T.wp[k + 2] + randomRange(-0.45, 0.45), y = T.wp[k + 1];
     if (hypot(x, z) > 170 || nearPose(x, z)) continue;
-    const m = magAt(x, z), zp = zoneP(x, z), u = rnd();
-    if (m > 0.3 && u < m * 0.9) for (let j = 0; j < 4; j++) leaf(small, x + rr(-0.1, 0.1), y - 0.05, z + rr(-0.1, 0.1), rr(0.12, 0.34), rnd() * TAU, rr(0.05, 0.75), rr(0.04, 0.08), 0, 5, rnd(), rnd(), rr(0.3, 0.7));
-    else if (u < m * 0.9 + 0.5 * max(zp, hot(x, z)) * sstep(0.42, 0.6, fbm(x * 0.09, 9, z * 0.09, 2))) for (let j = 0; j < 3; j++) leaf(small, x + rr(-0.1, 0.1), y - 0.05, z + rr(-0.1, 0.1), rr(0.25, 0.7), rnd() * TAU, rr(0.1, 0.8), rr(0.05, 0.1), 0, 7, rnd(), rnd(), rr(0.3, 0.8));
+    const m = magAt(x, z), zp = zoneP(x, z), u = random01();
+    if (m > 0.3 && u < m * 0.9) for (let j = 0; j < 4; j++) addLeaf(small, x + randomRange(-0.1, 0.1), y - 0.05, z + randomRange(-0.1, 0.1), randomRange(0.12, 0.34), random01() * TAU, randomRange(0.05, 0.75), randomRange(0.04, 0.08), 0, 5, random01(), random01(), randomRange(0.3, 0.7));
+    else if (u < m * 0.9 + 0.5 * max(zp, hot(x, z)) * sstep(0.42, 0.6, fbm(x * 0.09, 9, z * 0.09, 2))) for (let j = 0; j < 3; j++) addLeaf(small, x + randomRange(-0.1, 0.1), y - 0.05, z + randomRange(-0.1, 0.1), randomRange(0.25, 0.7), random01() * TAU, randomRange(0.1, 0.8), randomRange(0.05, 0.1), 0, 7, random01(), random01(), randomRange(0.3, 0.8));
   }
 
   // --- sponges and coral (clustered on rock)
   const spots = [];
   const ZS = [[-58, 8, 30, 1], [0, 0, 30, 0.7], [6, 84, 36, 0.9], [4, -88, 22, 0.6], [44, 20, 24, 0.5]];
   const zw = (x, z) => { let h = 0.45; for (const p of ZS) h = max(h, p[3] * sstep(p[2], p[2] * 0.4, hypot(x - p[0], z - p[1]))); return h; };
-  rseed(6);
+  resetRandomSeed(6);
   for (let i = 0; i < 13000; i++) {
     const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
-    if (hypot(x, z) > 170 || y > -8 || T.wn[k + 1] < -0.15 || rnd() > zw(x, z) || nearFly(x, y, z, 3)) continue;
-    const n0 = [T.wn[k], T.wn[k + 1], T.wn[k + 2]], [t1, t2] = tangent(n0), coral = T.wn[k + 1] > 0.85 || rnd() < 0.35, cnt = coral ? 2 + rnd() * 5 | 0 : 3 + rnd() * 9 | 0, sd = rnd();
+    if (hypot(x, z) > 170 || y > -8 || T.wn[k + 1] < -0.15 || random01() > zw(x, z) || nearFly(x, y, z, 3)) continue;
+    const n0 = [T.wn[k], T.wn[k + 1], T.wn[k + 2]], [t1, t2] = tangent(n0), coral = T.wn[k + 1] > 0.85 || random01() < 0.35, cnt = coral ? 2 + random01() * 5 | 0 : 3 + random01() * 9 | 0, sd = random01();
     for (let j = 0; j < cnt; j++) {
-      const a = rr(-1, 1) * (0.5 + cnt * 0.13), b = rr(-1, 1) * (0.5 + cnt * 0.13);
+      const a = randomRange(-1, 1) * (0.5 + cnt * 0.13), b = randomRange(-1, 1) * (0.5 + cnt * 0.13);
       const s = snap(x + t1[0] * a + t2[0] * b, y + t1[1] * a + t2[1] * b, z + t1[2] * a + t2[2] * b, n0);
       if (!s) continue;
       let ux = s[3], uy = s[4] + (coral ? 0.9 : 1.1), uz = s[5]; const l = hypot(ux, uy, uz); ux /= l; uy /= l; uz /= l;
-      const q = qMul(qFromY(ux, uy, uz), qAxis(0, 1, 0, rnd() * TAU)), sc = coral ? rr(0.5, 1.5) : rr(0.35, 0.9) * (rnd() < 0.1 ? 1.6 : 1);
-      solid(coral ? 7 + (rnd() * 3 | 0) : 4 + (rnd() * 3 | 0), s[0] - ux * 0.12 * sc, s[1] - uy * 0.12 * sc, s[2] - uz * 0.12 * sc, sc, q, coral ? 5 : 4, fract(sd + rr(-0.03, 0.03)), 1, 0);
+      const q = multiplyQuaternions(quaternionFromUp(ux, uy, uz), quaternionFromAxisAngle(0, 1, 0, random01() * TAU)), sc = coral ? randomRange(0.5, 1.5) : randomRange(0.35, 0.9) * (random01() < 0.1 ? 1.6 : 1);
+      addSolidInstance(coral ? 7 + (random01() * 3 | 0) : 4 + (random01() * 3 | 0), s[0] - ux * 0.12 * sc, s[1] - uy * 0.12 * sc, s[2] - uz * 0.12 * sc, sc, q, coral ? 5 : 4, fract(sd + randomRange(-0.03, 0.03)), 1, 0);
     }
-    if (!coral && rnd() < 0.3) spots.push([x + n0[0], y + n0[1] + 0.5, z + n0[2]]);
+    if (!coral && random01() < 0.3) spots.push([x + n0[0], y + n0[1] + 0.5, z + n0[2]]);
   }
 
   // dense sponge / coral gardens: x, z, radius, count
-  rseed(7);
+  resetRandomSeed(7);
   for (const g of [[-68, -6, 9, 260], [-66, 6, 7, 160], [16, 72, 7, 200], [-6, 74, 6, 120], [-13, -2, 6, 80], [8, -88, 8, 160], [44, 12, 7, 120], [-62, 22, 6, 140], [-47, 40, 6, 140], [-30, 47, 6, 120], [-12, 48, 5, 100], [14, 28, 6, 140], [28, 45, 6, 120], [-36, -76, 6, 130], [-49, -58, 6, 130], [-58, -38, 6, 120]]) {
     let made = 0;
     for (let i = 0; i < 400000 && made < g[3]; i++) {
       const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
       if (hypot(x - g[0], z - g[1]) > g[2] || y > -14 || T.wn[k + 1] < -0.1 || nearFly(x, y, z, 2.2)) continue;
       made++;
-      const coral = T.wn[k + 1] > 0.85 || rnd() < 0.3, nx = T.wn[k], ny = T.wn[k + 1] + (coral ? 0.9 : 1.1), nz = T.wn[k + 2], l = hypot(nx, ny, nz);
-      const sc = coral ? rr(0.5, 1.4) : rr(0.35, 0.9) * (rnd() < 0.15 ? 1.7 : 1);
-      solid(coral ? 7 + (rnd() * 3 | 0) : 4 + (rnd() * 3 | 0), x - nx / l * 0.1 * sc, y - ny / l * 0.1 * sc, z - nz / l * 0.1 * sc, sc, qMul(qFromY(nx / l, ny / l, nz / l), qAxis(0, 1, 0, rnd() * TAU)), coral ? 5 : 4, rnd(), 1, 0);
+      const coral = T.wn[k + 1] > 0.85 || random01() < 0.3, nx = T.wn[k], ny = T.wn[k + 1] + (coral ? 0.9 : 1.1), nz = T.wn[k + 2], l = hypot(nx, ny, nz);
+      const sc = coral ? randomRange(0.5, 1.4) : randomRange(0.35, 0.9) * (random01() < 0.15 ? 1.7 : 1);
+      addSolidInstance(coral ? 7 + (random01() * 3 | 0) : 4 + (random01() * 3 | 0), x - nx / l * 0.1 * sc, y - ny / l * 0.1 * sc, z - nz / l * 0.1 * sc, sc, multiplyQuaternions(quaternionFromUp(nx / l, ny / l, nz / l), quaternionFromAxisAngle(0, 1, 0, random01() * TAU)), coral ? 5 : 4, random01(), 1, 0);
     }
   }
   // --- rocks: floating boulder clusters + scattered ground rocks
   const BOULD = [[-11, -11, -105, 14, 5], [-56, -19, -18, 18, 6], [10, -13, -88, 22, 7], [24, -15, -24, 22, 7], [-18, -12, 4, 14, 6], [30, -14, 30, 16, 6], [36, -12, -70, 22, 8], [-30, -13, -84, 16, 7], [-58, -14, 0, 14, 6], [19, -13, 98, 18, 6], [62, -9, 34, 14, 6]];
-  rseed(8);
-  for (let i = 0; i < 9; i++) { const a = rnd() * TAU, r = rr(60, 150); BOULD.push([cos(a) * r, rr(-20, -9), sin(a) * r, 10 + rnd() * 12 | 0, rr(5, 9)]); }
+  resetRandomSeed(8);
+  for (let i = 0; i < 9; i++) { const a = random01() * TAU, r = randomRange(60, 150); BOULD.push([cos(a) * r, randomRange(-20, -9), sin(a) * r, 10 + random01() * 12 | 0, randomRange(5, 9)]); }
   for (const b of BOULD) for (let i = 0; i < b[3]; i++) {
-    const sc = rnd() < 0.12 ? rr(1.8, 3.2) : rr(0.35, 1.5);
-    const x = b[0] + rr(-1, 1) * b[4], y = b[1] + rr(-1, 1) * b[4] * 0.6, z = b[2] + rr(-1, 1) * b[4];
+    const sc = random01() < 0.12 ? randomRange(1.8, 3.2) : randomRange(0.35, 1.5);
+    const x = b[0] + randomRange(-1, 1) * b[4], y = b[1] + randomRange(-1, 1) * b[4] * 0.6, z = b[2] + randomRange(-1, 1) * b[4];
     if (Dw(x, y, z) > -sc) continue;
-    const bob = rr(0.12, 0.4), sd = rnd();
-    solid(rnd() * 4 | 0, x, min(y, -2 - sc), z, sc, qRand(), 1, sd, 1, bob);
-    if (sc > 1.1) for (let j = 0; j < 7; j++) solid(rnd() * 4 | 0, x + rr(-1.6, 1.6) * sc, min(y, -2 - sc) + rr(-1.4, 1) * sc, z + rr(-1.6, 1.6) * sc, rr(0.1, 0.35), qRand(), 1, sd, 1, bob);
+    const bob = randomRange(0.12, 0.4), sd = random01();
+    addSolidInstance(random01() * 4 | 0, x, min(y, -2 - sc), z, sc, randomQuaternion(), 1, sd, 1, bob);
+    if (sc > 1.1) for (let j = 0; j < 7; j++) addSolidInstance(random01() * 4 | 0, x + randomRange(-1.6, 1.6) * sc, min(y, -2 - sc) + randomRange(-1.4, 1) * sc, z + randomRange(-1.6, 1.6) * sc, randomRange(0.1, 0.35), randomQuaternion(), 1, sd, 1, bob);
   }
-  rseed(9);
+  resetRandomSeed(9);
   for (let i = 0; i < 2600; i++) {
     const k = pickV(); if (T.wn[k + 1] < 0.7 || hypot(T.wp[k], T.wp[k + 2]) > 170 || nearFly(T.wp[k], T.wp[k + 1], T.wp[k + 2], 6)) continue;
-    const sc = rr(0.25, 1.3) * (rnd() < 0.1 ? 2 : 1);
-    solid(rnd() * 4 | 0, T.wp[k], T.wp[k + 1] + sc * 0.2, T.wp[k + 2], sc, qRand(), 1, rnd(), 1, 0);
+    const sc = randomRange(0.25, 1.3) * (random01() < 0.1 ? 2 : 1);
+    addSolidInstance(random01() * 4 | 0, T.wp[k], T.wp[k + 1] + sc * 0.2, T.wp[k + 2], sc, randomQuaternion(), 1, random01(), 1, 0);
   }
 
-  rseed(10);
+  resetRandomSeed(10);
   for (let i = 0; i < 60000; i++) {
     const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
-    if (hypot(x, z) > 172 || y > -3 || (ny > 0.8 && rnd() < 0.6) || nearFly(x, y, z, 3.5)) continue;
-    const sc = (0.35 + 2.1 * pow(rnd(), 2.6)) * (ny > 0.8 ? 0.5 : 1), q = qRand();
-    chunks[(sc > 1.15 ? 3 : 0) + (rnd() * 3 | 0)][cellOf(x, z)].push(x - T.wn[k] * sc * 0.3, y - ny * sc * 0.3, z - T.wn[k + 2] * sc * 0.3, sc, q[0], q[1], q[2], q[3], 1, rnd(), sc > 1.15 ? 0 : 96, 0);
+    if (hypot(x, z) > 172 || y > -3 || (ny > 0.8 && random01() < 0.6) || nearFly(x, y, z, 3.5)) continue;
+    const sc = (0.35 + 2.1 * pow(random01(), 2.6)) * (ny > 0.8 ? 0.5 : 1), q = randomQuaternion();
+    chunks[(sc > 1.15 ? 3 : 0) + (random01() * 3 | 0)][cellOf(x, z)].push(x - T.wn[k] * sc * 0.3, y - ny * sc * 0.3, z - T.wn[k + 2] * sc * 0.3, sc, q[0], q[1], q[2], q[3], 1, random01(), sc > 1.15 ? 0 : 96, 0);
   }
-  rseed(11);
+  resetRandomSeed(11);
   for (let i = 0; i < 170000; i++) { // pebbles and rubble on the sea floor
-    const k = pickV(), x = T.wp[k] + rr(-0.4, 0.4), z = T.wp[k + 2] + rr(-0.4, 0.4), y = T.wp[k + 1];
+    const k = pickV(), x = T.wp[k] + randomRange(-0.4, 0.4), z = T.wp[k + 2] + randomRange(-0.4, 0.4), y = T.wp[k + 1];
     if (T.wn[k + 1] < 0.8 || hypot(x, z) > 170 || nearFly(x, y, z, 1.3)) continue;
-    const sc = 0.05 + 0.3 * pow(rnd(), 2), q = qRand();
-    nth++ % THIN || chunks[6][cellOf(x, z)].push(x, y - sc * 0.25, z, sc, q[0], q[1], q[2], q[3], 1, rnd(), 44, 0);
+    const sc = 0.05 + 0.3 * pow(random01(), 2), q = randomQuaternion();
+    nth++ % THIN || chunks[6][cellOf(x, z)].push(x, y - sc * 0.25, z, sc, q[0], q[1], q[2], q[3], 1, random01(), 44, 0);
   }
   // --- set pieces
   const gy = (x, z) => { const f = floorsAt(x, z); return f.length ? f[f.length - 2] : -45; };
-  solid(10, -5, gy(-5, -4) - 0.6, -4, 1, qMul(qAxis(0, 1, 0, 1.2), qMul(qAxis(0, 0, 1, 0.16), qAxis(1, 0, 0, -0.3))), 2, 0.3, 1, 0);          // whale fluke
-  solid(11, 59.5, -23, 6, 1, qMul(qAxis(0, 1, 0, -PI / 2), qMul(qAxis(0, 0, 1, -0.1), qAxis(1, 0, 0, 0.32))), 3, 0.5, 1, 0); // ship hull
+  addSolidInstance(10, -5, gy(-5, -4) - 0.6, -4, 1, multiplyQuaternions(quaternionFromAxisAngle(0, 1, 0, 1.2), multiplyQuaternions(quaternionFromAxisAngle(0, 0, 1, 0.16), quaternionFromAxisAngle(1, 0, 0, -0.3))), 2, 0.3, 1, 0);          // whale fluke
+  addSolidInstance(11, 59.5, -23, 6, 1, multiplyQuaternions(quaternionFromAxisAngle(0, 1, 0, -PI / 2), multiplyQuaternions(quaternionFromAxisAngle(0, 0, 1, -0.1), quaternionFromAxisAngle(1, 0, 0, 0.32))), 3, 0.5, 1, 0); // ship hull
   // barrel sponges in front of viewpoint 4, small sponges around the fluke base
-  rseed(12);
-  for (const b of [[7, 3.2, 1.3, 4], [8.4, 4.6, 1.0, 6], [9.6, 2.6, 1.5, 4], [11, 5, 1.1, 5], [8, -3.6, 1.2, 4], [12.5, 2, 1.2, 6], [9, 3.9, 0.8, 4]]) { const p = rel(3, b[0], b[1]), c = POSES[3]; let ux = (c[0] - p[0]) * 0.07, uz = (c[2] - p[1]) * 0.07; const l = hypot(ux, 1, uz); solid(b[3], p[0], gy(p[0], p[1]) - 0.1, p[1], b[2], qFromY(ux / l, 1 / l, uz / l), 4, rnd(), 1, 0); }
-  for (let i = 0; i < 9; i++) { const a = rnd() * TAU; const x = -5 + cos(a) * rr(1.2, 2.6), z = -4 + sin(a) * rr(1.5, 4); solid(6, x, gy(x, z) + 0.05, z, rr(0.4, 0.9), qAxis(0, 1, 0, rnd() * 6), 4, rnd(), 1, 0); }
+  resetRandomSeed(12);
+  for (const b of [[7, 3.2, 1.3, 4], [8.4, 4.6, 1.0, 6], [9.6, 2.6, 1.5, 4], [11, 5, 1.1, 5], [8, -3.6, 1.2, 4], [12.5, 2, 1.2, 6], [9, 3.9, 0.8, 4]]) { const p = rel(3, b[0], b[1]), c = POSES[3]; let ux = (c[0] - p[0]) * 0.07, uz = (c[2] - p[1]) * 0.07; const l = hypot(ux, 1, uz); addSolidInstance(b[3], p[0], gy(p[0], p[1]) - 0.1, p[1], b[2], quaternionFromUp(ux / l, 1 / l, uz / l), 4, random01(), 1, 0); }
+  for (let i = 0; i < 9; i++) { const a = random01() * TAU; const x = -5 + cos(a) * randomRange(1.2, 2.6), z = -4 + sin(a) * randomRange(1.5, 4); addSolidInstance(6, x, gy(x, z) + 0.05, z, randomRange(0.4, 0.9), quaternionFromAxisAngle(0, 1, 0, random01() * 6), 4, random01(), 1, 0); }
 
   // --- bubbles
   const VENTS = [[4, -44, -3], [4.5, -44, -3.5], [-1, -44, 2], [2, -44, -1], [5.5, -44, -7], [3, -44, -9], [6, -44, -90], [8, -44, -84], [4, -44, -93], [-9, -44, 3], [5, -35, -86], [9, -37, -92], [40, -44, 20], [-56, -44, 12], [10, -44, 80], [-2, -44, 30], [0, -44, -30], [12, -44, 2], [6, -44, -2], [46, -44, 30], [-20, -44, -103], [-52, -44, -12], [4, -44, 70], [9, -44, -74], [4, -44, -78], [14, -44, 26], [26, -44, 40], [-45, -44, -64], [-55, -44, -40], [-58, -44, 22], [-40, -44, 40], [-14, -44, 45], [-1, -44, -9], [-7, -44, -6]];
-  rseed(13);
-  for (const s of spots) if (rnd() < 0.28) VENTS.push(s);
+  resetRandomSeed(13);
+  for (const s of spots) if (random01() < 0.28) VENTS.push(s);
   for (const v of VENTS) {
-    const n = 90 + rnd() * 70 | 0, y0 = v[1] === -44 ? gy(v[0], v[2]) : v[1];
+    const n = 90 + random01() * 70 | 0, y0 = v[1] === -44 ? gy(v[0], v[2]) : v[1];
     for (let i = 0; i < n; i++) {
-      const sz = rnd() < 0.24 ? rr(0.1, 0.3) : rr(0.025, 0.08);
-      bubbles.push(v[0] + rr(-0.3, 0.3), y0, v[2] + rr(-0.3, 0.3), sz, rnd(), rr(1.1, 2.4) * (0.6 + sz * 3), -y0 - 0.2, rr(0.05, 0.16));
+      const sz = random01() < 0.24 ? randomRange(0.1, 0.3) : randomRange(0.025, 0.08);
+      bubbles.push(v[0] + randomRange(-0.3, 0.3), y0, v[2] + randomRange(-0.3, 0.3), sz, random01(), randomRange(1.1, 2.4) * (0.6 + sz * 3), -y0 - 0.2, randomRange(0.05, 0.16));
     }
   }
 
@@ -319,16 +349,16 @@ function makeWorld(D, T, flyPts, POSES) {
 
   // --- fish schools + mantas
   const fish = [];
-  rseed(14);
+  resetRandomSeed(14);
   const SCH = [[-2, -36, -10, 15, 520, 0.3, 1, 0.945], [8, -30, -70, 22, 420, 0.32, -1], [48, -30, 14, 18, 360, 0.3, 1], [-58, -30, -8, 11, 420, 0.28, -1, 0.3], [8, -36, 84, 16, 320, 0.28, 1],
     [-90, -28, -70, 25, 300, 0.3, 1], [95, -30, 70, 25, 300, 0.3, -1], [0, -22, 20, 30, 380, 0.34, -1], [-30, -30, -100, 18, 300, 0.3, 1], [16, -36, 30, 12, 300, 0.3, 1], [-48, -34, -58, 12, 300, 0.3, -1], [-45, -35, 38, 14, 320, 0.3, 1]];
-  for (const s of SCH) { const ss = s[7] === undefined ? rnd() : s[7]; for (let i = 0; i < s[4]; i++) fish.push(s[0], s[1], s[2], s[3], rnd(), s[6] * 1.9 / s[3], s[5], ss); }
+  for (const s of SCH) { const ss = s[7] === undefined ? random01() : s[7]; for (let i = 0; i < s[4]; i++) fish.push(s[0], s[1], s[2], s[3], random01(), s[6] * 1.9 / s[3], s[5], ss); }
   const mantas = [];
   for (const m of [[1, -28, 3.5, 14, 3.012, 0.085, 3.6, 0.1], [49, -31, 24.5, 5, 0.029, -0.08, 3.7, 0.4], [0, -14, -80, 34, 0.3, 0.06, 5.2, 0.7], [-50, -18, 20, 26, 5, -0.075, 3.8, 0.55], [10, -16, 86, 26, 2.2, 0.07, 4.4, 0.85], [20, -11, -20, 46, 4.2, -0.045, 5.6, 0.25]]) mantas.push(...m);
 
   // --- drifting particles
   const snow = new Float32Array(9000 * 4);
-  for (let i = 0; i < snow.length; i++) snow[i] = rnd();
+  for (let i = 0; i < snow.length; i++) snow[i] = random01();
 
   const sol = { data: [], ranges: [] }; let si = 0;
   for (let m = 0; m < 12; m++) { const a = solids[m] || []; sol.ranges.push([si, a.length / 12]); si += a.length / 12; for (let i = 0; i < a.length; i++) sol.data.push(a[i]); }
@@ -346,10 +376,10 @@ function makeWorld(D, T, flyPts, POSES) {
 const fract = (x) => x - floor(x);
 
 // ---------------------------------------------------------------- procedural meshes
-function meshChunk(sd, sub = 2, det = sub > 2) {
+function createRockChunkGeometry(sd, sub = 2, det = sub > 2) {
   if (LV > 1 && sub > 1) sub--; // Low: a quarter of the triangles
-  rseed(100 + sd);
-  const pl = []; for (let i = 0; i < 4; i++) { const q = qRand(); pl.push([q[0], q[1], q[2], rr(0.8, 0.98)]); const l = hypot(q[0], q[1], q[2]) || 1; pl[i][0] /= l; pl[i][1] /= l; pl[i][2] /= l; }
+  resetRandomSeed(100 + sd);
+  const pl = []; for (let i = 0; i < 4; i++) { const q = randomQuaternion(); pl.push([q[0], q[1], q[2], randomRange(0.8, 0.98)]); const l = hypot(q[0], q[1], q[2]) || 1; pl[i][0] /= l; pl[i][1] /= l; pl[i][2] /= l; }
   return icosphere(sub, (x, y, z) => {
     let r = 1 + (fbm(x * 1.6 + sd, y * 1.6, z * 1.6, 2) - 0.5) * 0.9 + (det ? (fbm(x * 4 + sd, y * 4, z * 4, 2) - 0.5) * 0.25 : 0);
     let px = x * r, py = y * r * 0.8, pz = z * r;
@@ -357,33 +387,33 @@ function meshChunk(sd, sub = 2, det = sub > 2) {
     return [px, py, pz];
   });
 }
-function meshLathe(prof, seg, lump, ribs = 0) {
+function createLathedGeometry(prof, seg, lump, ribs = 0) {
   const m = new Mesh(), rings = [];
   for (const [r, h, ao] of prof) { const ring = []; for (let s = 0; s < seg; s++) { const a = s / seg * TAU, rl = r * (1 + lump * (fbm(cos(a) * 1.5 + h * 2, h * 3, sin(a) * 1.5, 2) - 0.5) + 0.07 * cos(ribs * a + h * 1.5)); ring.push(m.v(cos(a) * rl, h, sin(a) * rl, ao)); } rings.push(ring); }
   for (let k = 0; k < rings.length - 1; k++) for (let s = 0; s < seg; s++) { const s2 = (s + 1) % seg; m.quad(rings[k][s], rings[k + 1][s], rings[k + 1][s2], rings[k][s2]); }
   return m;
 }
-function meshCoral(fan, lo = LV > 1) {
-  rseed(200 + fan);
+function createCoralGeometry(fan, lo = LV > 1) {
+  resetRandomSeed(200 + fan);
   const m = new Mesh();
   const nrm = (v) => { const l = hypot(...v) || 1; return v.map((c) => c / l); };
   const br = (p, d, r, len, depth) => {
     const pts = [p]; let q = p;
-    for (let i = 0; i < 3; i++) { d = nrm([d[0] + rr(-0.3, 0.3), d[1] + rr(-0.1, 0.3), d[2] + (fan ? rr(-0.05, 0.05) : rr(-0.3, 0.3))]); q = [q[0] + d[0] * len / 3, q[1] + d[1] * len / 3, q[2] + d[2] * len / 3]; pts.push(q); }
+    for (let i = 0; i < 3; i++) { d = nrm([d[0] + randomRange(-0.3, 0.3), d[1] + randomRange(-0.1, 0.3), d[2] + (fan ? randomRange(-0.05, 0.05) : randomRange(-0.3, 0.3))]); q = [q[0] + d[0] * len / 3, q[1] + d[1] * len / 3, q[2] + d[2] * len / 3]; pts.push(q); }
     if (!depth) pts.push([q[0] + d[0] * r * 1.6, q[1] + d[1] * r * 1.6, q[2] + d[2] * r * 1.6]);
     if (lo) m.tube(depth ? [pts[0], pts[3]] : [pts[0], pts[3], pts[4]], (k) => (k > 1 ? r * 0.36 : r * (1 - 0.22 * k)) * 1.25, 3, true, (k) => clamp(1 - (depth + 1 - k) / 5, 0, 1));
     else m.tube(pts, (k) => k > 3 ? r * 0.36 : r * (1 - 0.22 * k / 3), fan ? 5 : 6, true, (k) => clamp(1 - (depth + 1 - k / 3) / 5, 0, 1));
-    if (depth > 0) { const n = 2 + (rnd() < 0.5); for (let i = 0; i < n; i++) br(q, nrm([d[0] + rr(-0.8, 0.8), d[1] + rr(-0.1, 0.5), d[2] + (fan ? rr(-0.08, 0.08) : rr(-0.8, 0.8))]), r * 0.78, len * 0.8, depth - 1); }
+    if (depth > 0) { const n = 2 + (random01() < 0.5); for (let i = 0; i < n; i++) br(q, nrm([d[0] + randomRange(-0.8, 0.8), d[1] + randomRange(-0.1, 0.5), d[2] + (fan ? randomRange(-0.08, 0.08) : randomRange(-0.8, 0.8))]), r * 0.78, len * 0.8, depth - 1); }
   };
-  const n0 = fan ? 1 : 2 + (rnd() * 2 | 0);
-  for (let i = 0; i < n0; i++) br([rr(-0.08, 0.08), 0, rr(-0.08, 0.08)], nrm([rr(-0.5, 0.5), 1, fan ? 0 : rr(-0.5, 0.5)]), fan ? 0.06 : 0.08, fan ? 0.5 : 0.45, 3);
+  const n0 = fan ? 1 : 2 + (random01() * 2 | 0);
+  for (let i = 0; i < n0; i++) br([randomRange(-0.08, 0.08), 0, randomRange(-0.08, 0.08)], nrm([randomRange(-0.5, 0.5), 1, fan ? 0 : randomRange(-0.5, 0.5)]), fan ? 0.06 : 0.08, fan ? 0.5 : 0.45, 3);
   return m;
 }
-function meshTubes() {
-  rseed(210);
+function createTubeSpongeGeometry() {
+  resetRandomSeed(210);
   const m = new Mesh();
   for (let i = 0; i < 9; i++) {
-    const a = rnd() * TAU, r0 = rr(0, 0.28), h = rr(0.45, 1.1), rad = rr(0.07, 0.12), lean = rr(0.05, 0.3), pts = [];
+    const a = random01() * TAU, r0 = randomRange(0, 0.28), h = randomRange(0.45, 1.1), rad = randomRange(0.07, 0.12), lean = randomRange(0.05, 0.3), pts = [];
     for (let k = 0; k <= 4; k++) pts.push([cos(a) * (r0 + lean * k / 4 * h), h * k / 4, sin(a) * (r0 + lean * k / 4 * h)]);
     m.tube(pts, (k) => rad * (0.8 + 0.25 * k / 4), 12, false, (k) => 0.35 + 0.65 * k / 4);
     // rim + dark throat
@@ -393,7 +423,7 @@ function meshTubes() {
   return m;
 }
 // stone whale fluke: SDF of tapered capsules -> surface nets
-function meshFluke() {
+function createWhaleFlukeGeometry() {
   const C = [];
   const chain = (pts, zs) => { for (let i = 0; i < pts.length - 1; i++) C.push([...pts[i], ...pts[i + 1], zs]); };
   chain([[0, -1.6, 3.7, 1.2], [0, 1.8, 2.35, 0.98], [0, 4.6, 1.0, 0.76], [0, 6.9, 0.1, 0.6]], 0.8);
@@ -413,7 +443,7 @@ function meshFluke() {
   };
   const vs = 0.09, ox = -7.6, oy = -2.6, oz = -2.2, nx = 186, ny = 216, nz = 76, D = new Float32Array(nx * ny * nz);
   for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) D[x + nx * (y + ny * z)] = -sdf(ox + x * vs, oy + y * vs, oz + z * vs);
-  const sn = surfaceNets(D, nx, ny, nz), smp = sampler3(D, nx, ny, nz);
+  const sn = extractSurfaceNets(D, nx, ny, nz), smp = createTrilinearSampler(D, nx, ny, nz);
   const vb = new ArrayBuffer(sn.nv * 16), f = new Float32Array(vb), s = new Int8Array(vb);
   for (let k = 0; k < sn.nv; k++) {
     const x = sn.pos[k * 3], y = sn.pos[k * 3 + 1], z = sn.pos[k * 3 + 2], e = 0.7;
@@ -426,8 +456,8 @@ function meshFluke() {
 }
 // sunken ship (bow at +x): keel with stem and stern posts, curved ribs, hull planking with a breach,
 // raised stern castle with transom, deck remnants, two masts with yards, bowsprit
-function meshShip() {
-  rseed(220);
+function createShipwreckGeometry() {
+  resetRandomSeed(220);
   const m = new Mesh(), Lh = 17, B = 5.6, Dp = 7.6;
   const hb = (x) => B * pow(max(1 - pow(abs(x / Lh), x < 0 ? 3.6 : 2.6), 0), 0.5);
   const dp = (x) => Dp * (1 - 0.36 * pow(abs(x / Lh), 2.5));
@@ -439,11 +469,11 @@ function meshShip() {
   for (let i = 0; i <= 44; i++) { const x = mix(-Lh - 1.0, Lh + 2.4, i / 44), e = max(abs(x) / Lh - 0.78, 0) * 4.2; keel.push([x, -dp(clamp(x, -Lh, Lh)) - 0.3 + e * e * e * 4.2, 0]); }
   m.sweep(keel, 0.55, 0.95, up);
   for (let x = -Lh + 0.7; x < Lh - 0.3; x += 0.8) {
-    const a0 = rnd() < 0.1 ? rr(-0.9, -0.2) : -PI / 2, a1 = rnd() < 0.1 ? rr(0.2, 0.9) : PI / 2, pts = [];
+    const a0 = random01() < 0.1 ? randomRange(-0.9, -0.2) : -PI / 2, a1 = random01() < 0.1 ? randomRange(0.2, 0.9) : PI / 2, pts = [];
     for (let i = 0; i <= 16; i++) pts.push(pt(x, mix(a0, a1, i / 16)));
     m.sweep(pts, 0.24, 0.3, out);
   }
-  const holeX = rr(-6, 2), holeS = rnd() < 0.5 ? 1 : -1;
+  const holeX = randomRange(-6, 2), holeS = random01() < 0.5 ? 1 : -1;
   const BR = [[holeX, holeS * 0.8, 3.2, 0.42], [7, -holeS * 0.95, 2.4, 0.34], [12, holeS * 0.5, 1.7, 0.28], [-11, -holeS * 0.55, 2.1, 0.3]];
   const holed = (x, ph) => { for (const h of BR) { const a = (x - h[0]) / h[2], b = (ph - h[1]) / h[3]; if (a * a + b * b < 1 + 0.45 * sin(x * 3.1 + ph * 9)) return true; } return false; };
   const NS = 14, xs = []; for (let x = -Lh + 0.35; x <= Lh - 0.3; x += 0.85) xs.push(x);
@@ -465,9 +495,9 @@ function meshShip() {
     for (let j = 0; j < 3; j++) { pts = []; for (let x = -Lh + 0.4; x <= -Lh + 8.5 - j; x += 0.9) pts.push([x, sheer(x) + 0.55 + j * 0.86, sgn * (max(hb(x), 2.6) + 0.15)]); m.sweep(pts, 0.82, 0.09, () => [0, 0, sgn]); }
   }
   // transom
-  for (let y = -3; y < sheer(-Lh) + 3; y += 0.86) { const w = max(1.2, 2.9 * sstep(-4.5, 1.5, y)); if (rnd() < 0.9) m.sweep([[-Lh + 0.35, y, -w], [-Lh + 0.35, y, w]], 0.82, 0.1, () => [1, 0, 0]); }
-  for (let x = -Lh + 2; x < Lh - 2; x += rr(1.8, 3.2)) m.sweep([[x, sheer(x) - 0.25, -hb(x)], [x, sheer(x) - 0.2, 0], [x, sheer(x) - 0.25, hb(x)]], 0.26, 0.26, up);
-  for (let z = -3.9; z <= 3.9; z += 0.62) { let x = -Lh + rr(1, 5); while (x < Lh - 4) { const x1 = min(x + rr(3, 9), Lh - 3.5); if (rnd() < 0.6) { const pts = []; for (let xx = x; xx <= x1; xx += 1) if (hb(xx) > abs(z) + 0.3) pts.push([xx, sheer(xx) - 0.05, z]); if (pts.length > 1) m.sweep(pts, 0.56, 0.07, up); } x = x1 + rr(0.5, 3); } }
+  for (let y = -3; y < sheer(-Lh) + 3; y += 0.86) { const w = max(1.2, 2.9 * sstep(-4.5, 1.5, y)); if (random01() < 0.9) m.sweep([[-Lh + 0.35, y, -w], [-Lh + 0.35, y, w]], 0.82, 0.1, () => [1, 0, 0]); }
+  for (let x = -Lh + 2; x < Lh - 2; x += randomRange(1.8, 3.2)) m.sweep([[x, sheer(x) - 0.25, -hb(x)], [x, sheer(x) - 0.2, 0], [x, sheer(x) - 0.25, hb(x)]], 0.26, 0.26, up);
+  for (let z = -3.9; z <= 3.9; z += 0.62) { let x = -Lh + randomRange(1, 5); while (x < Lh - 4) { const x1 = min(x + randomRange(3, 9), Lh - 3.5); if (random01() < 0.6) { const pts = []; for (let xx = x; xx <= x1; xx += 1) if (hb(xx) > abs(z) + 0.3) pts.push([xx, sheer(xx) - 0.05, z]); if (pts.length > 1) m.sweep(pts, 0.56, 0.07, up); } x = x1 + randomRange(0.5, 3); } }
   // foremast with yard, broken main mast, bowsprit
   m.sweep([[7, -Dp + 0.6, 0], [7.1, 1, 0], [7.4, 8, 0.3], [7.8, 15, 0.8]], (k) => 0.62 - k * 0.1, (k) => 0.62 - k * 0.1, () => [1, 0, 0]);
   m.sweep([[7.5, 9.5, -5.2], [7.5, 9.6, 0.3], [7.5, 9.2, 5.6]], 0.26, 0.26, up);
@@ -477,7 +507,7 @@ function meshShip() {
   return m;
 }
 // manta ray: span along x (half span = 1), nose +z; aux = span coordinate for the flap animation
-function meshManta() {
+function createMantaGeometry() {
   const m = new Mesh(), NU = 72, M = 22, rings = [];
   for (let j = 0; j <= NU; j++) {
     const u = j / NU * 2 - 1, au = abs(u);
@@ -500,7 +530,7 @@ function meshManta() {
   }
   return m;
 }
-function meshFish() {
+function createFishGeometry() {
   const m = new Mesh();
   const X = [0.5, 0.3, 0.05, -0.22, -0.34], H = [0.01, 0.13, 0.17, 0.09, 0.035], Wd = [0.01, 0.05, 0.065, 0.03, 0.012], rings = [];
   for (let i = 0; i < 5; i++) { const r = []; for (let k = 0; k < 6; k++) { const a = k / 6 * TAU; r.push(m.v(X[i], sin(a) * H[i], cos(a) * Wd[i])); } rings.push(r); }
