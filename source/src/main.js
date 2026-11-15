@@ -29,10 +29,10 @@ device.lost.then((l) => {
   if (LV < 2) { keep('abyssal', LV + 1); location.reload(); }
   dead = body.className = 'l e'; $('s').textContent = 'The graphics device was lost. Reload the page to try again.';
 });
-const ctx = canvas.getContext('webgpu'), FMT = navigator.gpu.getPreferredCanvasFormat();
-// Rendering targets use linear half-float HDR color and a 32-bit depth buffer.
-const Q = device.queue, HDR = 'rgba16float', DEPTH = 'depth32float';
-const TU = GPUTextureUsage, BU = GPUBufferUsage, SS = GPUShaderStage;
+const gpuCanvasContext = canvas.getContext('webgpu'), CANVAS_FORMAT = navigator.gpu.getPreferredCanvasFormat();
+// Rendering targets use linear half-float HDR_COLOR_FORMAT color and a 32-bit depth buffer.
+const gpuQueue = device.queue, HDR_COLOR_FORMAT = 'rgba16float', DEPTH_FORMAT = 'depth32float';
+const TEXTURE_USAGE = GPUTextureUsage, BUFFER_USAGE = GPUBufferUsage, SHADER_STAGE = GPUShaderStage;
 
 // Allocate an uploadable GPU buffer. WebGPU requires 4-byte-aligned buffer sizes.
 // Copying the data here means callers can release their CPU-side arrays after setup.
@@ -40,9 +40,9 @@ function uploadGpuBuffer(data, usage) {
   const alignedByteLength = (data.byteLength + 3) & ~3;
   const gpuBuffer = device.createBuffer({
     size: alignedByteLength,
-    usage: usage | BU.COPY_DST,
+    usage: usage | BUFFER_USAGE.COPY_DST,
   });
-  Q.writeBuffer(gpuBuffer, 0, data.buffer || data, data.byteOffset || 0, data.byteLength);
+  gpuQueue.writeBuffer(gpuBuffer, 0, data.buffer || data, data.byteOffset || 0, data.byteLength);
   return gpuBuffer;
 }
 
@@ -65,18 +65,18 @@ function createShaderModule(code) {
 const repeatSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: LV > 1 ? 1 : 8 });
 const clampSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 const shadowComparisonSampler = device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
-const shadowTexture = createGpuTexture(SHADOW, SHADOW, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-const tDummy = createGpuTexture(1, 1, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-const waterTexture = createGpuTexture(WATER, WATER, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 5 });
-const detailTexture = createGpuTexture(1024, 1024, 'rgba8unorm', TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 11 });
-const occlusionVolumeTexture = createGpuTexture(NX / 2, NY / 2, 'rg8unorm', TU.TEXTURE_BINDING | TU.COPY_DST, { d: NZ / 2 });
-const mapTexture = createGpuTexture(512, 512, 'rgba8unorm', TU.TEXTURE_BINDING | TU.COPY_DST);
+const shadowTexture = createGpuTexture(SHADOW, SHADOW, DEPTH_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING);
+const tDummy = createGpuTexture(1, 1, DEPTH_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING);
+const waterTexture = createGpuTexture(WATER, WATER, HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING, { mips: 5 });
+const detailTexture = createGpuTexture(1024, 1024, 'rgba8unorm', TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING, { mips: 11 });
+const occlusionVolumeTexture = createGpuTexture(NX / 2, NY / 2, 'rg8unorm', TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST, { d: NZ / 2 });
+const mapTexture = createGpuTexture(512, 512, 'rgba8unorm', TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST);
 
 const sceneUniformValues = new Float32Array(60), shadowUniformValues = new Float32Array(60);
-const sceneUniformBuffer = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST }), shadowUniformBuffer = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST });
-const waterUniformValues = new Float32Array(4), waterUniformBuffer = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST });
+const sceneUniformBuffer = device.createBuffer({ size: 240, usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST }), shadowUniformBuffer = device.createBuffer({ size: 240, usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST });
+const waterUniformValues = new Float32Array(4), waterUniformBuffer = device.createBuffer({ size: 16, usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST });
 
-const VF = SS.VERTEX | SS.FRAGMENT;
+const VF = SHADER_STAGE.VERTEX | SHADER_STAGE.FRAGMENT;
 const sceneBindGroupLayout = device.createBindGroupLayout({ entries: [
   { binding: 0, visibility: VF, buffer: {} },
   { binding: 1, visibility: VF, sampler: {} }, { binding: 2, visibility: VF, sampler: {} }, { binding: 3, visibility: VF, sampler: { type: 'comparison' } },
@@ -90,16 +90,20 @@ const createSceneBindGroup = (u, sh) => device.createBindGroup({ layout: sceneBi
 const sceneBindGroup = createSceneBindGroup(sceneUniformBuffer, shadowTexture), shadowBindGroup = createSceneBindGroup(shadowUniformBuffer, tDummy);
 const scenePipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [sceneBindGroupLayout] });
 
-const bglBlit = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.FRAGMENT, texture: {} }, { binding: 1, visibility: SS.FRAGMENT, sampler: {} }] });
+const bglBlit = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SHADER_STAGE.FRAGMENT, texture: {} }, { binding: 1, visibility: SHADER_STAGE.FRAGMENT, sampler: {} }] });
 const plBlit = device.createPipelineLayout({ bindGroupLayouts: [bglBlit] });
-const mBlit = createShaderModule(W_BLIT);
-const createBlitPipeline = (entry, format, add) => device.createRenderPipeline({ layout: plBlit, vertex: { module: mBlit, entryPoint: 'vs' },
-  fragment: { module: mBlit, entryPoint: entry, targets: [{ format, blend: add ? { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } : undefined }] } });
-const pMip8 = createBlitPipeline('fsMip', 'rgba8unorm'), pMip16 = createBlitPipeline('fsMip', HDR), pDown0 = createBlitPipeline('fsDown0', HDR), pDown = createBlitPipeline('fsDown', HDR), pUp = createBlitPipeline('fsUp', HDR, true);
+const blitShader = createShaderModule(W_BLIT);
+const createBlitPipeline = (entry, format, add) => device.createRenderPipeline({ layout: plBlit, vertex: { module: blitShader, entryPoint: 'vs' },
+  fragment: { module: blitShader, entryPoint: entry, targets: [{ format, blend: add ? { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } : undefined }] } });
+const detailMipmapPipeline = createBlitPipeline('fsMip', 'rgba8unorm'), waterMipmapPipeline = createBlitPipeline('fsMip', HDR_COLOR_FORMAT), firstBloomDownsamplePipeline = createBlitPipeline('fsDown0', HDR_COLOR_FORMAT), bloomDownsamplePipeline = createBlitPipeline('fsDown', HDR_COLOR_FORMAT), bloomUpsamplePipeline = createBlitPipeline('fsUp', HDR_COLOR_FORMAT, true);
 const createBlitBindGroup = (view) => device.createBindGroup({ layout: bglBlit, entries: [{ binding: 0, resource: view }, { binding: 1, resource: clampSampler }] });
 const createColorAttachment = (view, clear) => ({ view, loadOp: clear ? 'clear' : 'load', storeOp: 'store', clearValue: [0, 0, 0, 0] });
 
-// vertex layouts
+// Vertex layouts define the exact CPU/GPU contract.
+// Packed normals are SNORM8; mesh instances use 3 vec4s (48 bytes).
+// Procedural leaves use three instanced attributes (36 bytes), not mesh
+// vertices for every blade. The vertex shader expands the blades at draw time.
+// ---------------------------------------------------------------- vertex layouts
 const A = (shaderLocation, offset, format) => ({ shaderLocation, offset, format });
 const vbSolid = { arrayStride: 16, attributes: [A(0, 0, 'float32x3'), A(1, 12, 'snorm8x4')] };
 const ibSolid = { arrayStride: 48, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4')] };
@@ -110,43 +114,43 @@ const ibSnow = { arrayStride: 16, stepMode: 'instance', attributes: [A(0, 0, 'fl
 
 const createScenePipeline = (m, vsE, fsE, buffers, o = {}) => device.createRenderPipeline({ layout: scenePipelineLayout,
   vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
-  fragment: { module: m, entryPoint: fsE, targets: [{ format: HDR, blend: o.blend }] },
+  fragment: { module: m, entryPoint: fsE, targets: [{ format: HDR_COLOR_FORMAT, blend: o.blend }] },
   primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
-  depthStencil: { format: DEPTH, depthWriteEnabled: !o.blend, depthCompare: 'greater' }, multisample: { count: AA } });
+  depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: !o.blend, depthCompare: 'greater' }, multisample: { count: AA } });
 const createShadowPipeline = (m, vsE, buffers, o = {}) => device.createRenderPipeline({ layout: scenePipelineLayout,
   vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
   primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
-  depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 1.5 } });
+  depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 1.5 } });
 
 await reportLoadingProgress('Compiling shaders…', 0.05, 300);
-const mSolid = createShaderModule(W_SOLID), mLeaf = createShaderModule(W_LEAF), mAnim = createShaderModule(W_ANIM), mSurf = createShaderModule(W_SURF), mSpr = createShaderModule(W_SPR);
-const pTerrain = createScenePipeline(mSolid, 'vs', 'fs', [vbSolid, ibSolid], { cull: 'back' });
-const pSolid = createScenePipeline(mSolid, 'vs', 'fs', [vbSolid, ibSolid]);
-const pLeaf = createScenePipeline(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 9 } });
-const pLeaf5 = createScenePipeline(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 5 } });
-const pLeafS = createScenePipeline(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 70 } });
-const pLeafF = createScenePipeline(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
-const pFish = createScenePipeline(mAnim, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
-const pManta = createScenePipeline(mAnim, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
-const pSurf = createScenePipeline(mSurf, 'vs', 'fs', [], { strip: true }), pBack = createScenePipeline(mSurf, 'vsB', 'fsB', [], { strip: true });
-const pBub = createScenePipeline(mSpr, 'vsBub', 'fsBub', [ibBub], { strip: true, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } });
+const solidShader = createShaderModule(W_SOLID), leafShader = createShaderModule(W_LEAF), animalShader = createShaderModule(W_ANIM), surfaceShader = createShaderModule(W_SURF), particleShader = createShaderModule(W_SPR);
+const terrainPipeline = createScenePipeline(solidShader, 'vs', 'fs', [vbSolid, ibSolid], { cull: 'back' });
+const solidPipeline = createScenePipeline(solidShader, 'vs', 'fs', [vbSolid, ibSolid]);
+const nearKelpPipeline = createScenePipeline(leafShader, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 9 } });
+const midKelpPipeline = createScenePipeline(leafShader, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 5 } });
+const smallPlantPipeline = createScenePipeline(leafShader, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 70 } });
+const farKelpPipeline = createScenePipeline(leafShader, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
+const fishPipeline = createScenePipeline(animalShader, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
+const mantaPipeline = createScenePipeline(animalShader, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
+const waterSurfacePipeline = createScenePipeline(surfaceShader, 'vs', 'fs', [], { strip: true }), backgroundPipeline = createScenePipeline(surfaceShader, 'vsB', 'fsB', [], { strip: true });
+const bubblePipeline = createScenePipeline(particleShader, 'vsBub', 'fsBub', [ibBub], { strip: true, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } });
 const ADD = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
-const pSnow = createScenePipeline(mSpr, 'vsSnow', 'fsSnow', [ibSnow], { strip: true, blend: ADD });
-const pGl = createScenePipeline(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD, constants: { ROWS: 7 } });
-const pSolidSh = createShadowPipeline(mSolid, 'vs', [vbSolid, ibSolid]), pTerrSh = createShadowPipeline(mSolid, 'vs', [vbSolid, ibSolid], { cull: 'front' });
-const pLeafSh = createShadowPipeline(mLeaf, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
+const snowPipeline = createScenePipeline(particleShader, 'vsSnow', 'fsSnow', [ibSnow], { strip: true, blend: ADD });
+const glintPipeline = createScenePipeline(leafShader, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD, constants: { ROWS: 7 } });
+const solidShadowPipeline = createShadowPipeline(solidShader, 'vs', [vbSolid, ibSolid]), terrainShadowPipeline = createShadowPipeline(solidShader, 'vs', [vbSolid, ibSolid], { cull: 'front' });
+const leafShadowPipeline = createShadowPipeline(leafShader, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
 
-const mWater = createShaderModule(W_WATER);
-const pWater = device.createRenderPipeline({ layout: 'auto', vertex: { module: mWater, entryPoint: 'vs' }, fragment: { module: mWater, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const bgWater = device.createBindGroup({ layout: pWater.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: waterUniformBuffer } }] });
+const waterShader = createShaderModule(W_WATER);
+const waterAnimationPipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module: waterShader, entryPoint: 'vs' }, fragment: { module: waterShader, entryPoint: 'fs', targets: [{ format: HDR_COLOR_FORMAT }] } });
+const bgWater = device.createBindGroup({ layout: waterAnimationPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: waterUniformBuffer } }] });
 const waterViews = [0, 1, 2, 3, 4].map((m) => waterTexture.createView({ baseMipLevel: m, mipLevelCount: 1 }));
 const waterBG = waterViews.map((v) => createBlitBindGroup(v));
 const waterPass = waterViews.map((v) => ({ colorAttachments: [createColorAttachment(v, true)] }));
 
-const mRays = createShaderModule(W_RAYS), mPost = createShaderModule(W_POST), mRB = createShaderModule(W_RBLUR);
-const pRB = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRB, entryPoint: 'vs' }, fragment: { module: mRB, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const pRays = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRays, entryPoint: 'vs' }, fragment: { module: mRays, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const pPost = device.createRenderPipeline({ layout: 'auto', vertex: { module: mPost, entryPoint: 'vs' }, fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] } });
+const rayShader = createShaderModule(W_RAYS), compositeShader = createShaderModule(W_POST), rayBlurShader = createShaderModule(W_RBLUR);
+const rayBlurPipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module: rayBlurShader, entryPoint: 'vs' }, fragment: { module: rayBlurShader, entryPoint: 'fs', targets: [{ format: HDR_COLOR_FORMAT }] } });
+const volumetricRayPipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module: rayShader, entryPoint: 'vs' }, fragment: { module: rayShader, entryPoint: 'fs', targets: [{ format: HDR_COLOR_FORMAT }] } });
+const finalCompositePipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module: compositeShader, entryPoint: 'vs' }, fragment: { module: compositeShader, entryPoint: 'fs', targets: [{ format: CANVAS_FORMAT }] } });
 
 // ---------------------------------------------------------------- sun + shadow matrix
 const SUN = (() => { const v = [0.27, 1, -0.24], l = hypot(...v); return v.map((c) => c / l); })();
@@ -161,7 +165,7 @@ const SUN = (() => { const v = [0.27, 1, -0.24], l = hypot(...v); return v.map((
   for (let i = 0; i < 16; i++) { shadowUniformValues[16 + i] = m[i]; sceneUniformValues[16 + i] = m[i]; }
   for (let i = 0; i < 3; i++) { sceneUniformValues[48 + i] = shadowUniformValues[48 + i] = SUN[i]; }
   shadowUniformValues[32] = 0; shadowUniformValues[33] = -20; shadowUniformValues[34] = 0; shadowUniformValues[35] = 0; shadowUniformValues[58] = 1;
-  Q.writeBuffer(shadowUniformBuffer, 0, shadowUniformValues);
+  gpuQueue.writeBuffer(shadowUniformBuffer, 0, shadowUniformValues);
 }
 
 // ---------------------------------------------------------------- world generation
@@ -177,13 +181,13 @@ let D;
   const u = new ArrayBuffer(48), uu = new Uint32Array(u), uf = new Float32Array(u);
   uu[0] = NX; uu[1] = NY; uu[2] = NZ; uf[4] = OX; uf[5] = OY; uf[6] = OZ; uf[7] = VS;
   uu[8] = MESAS.length; uu[9] = ARCHES.length; uu[10] = HOLES.length; uu[11] = CLEARS.length;
-  const bu = uploadGpuBuffer(new Uint8Array(u), BU.UNIFORM), bp = uploadGpuBuffer(prims, BU.STORAGE);
-  const bd = device.createBuffer({ size, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size, usage: BU.MAP_READ | BU.COPY_DST });
+  const bu = uploadGpuBuffer(new Uint8Array(u), BUFFER_USAGE.UNIFORM), bp = uploadGpuBuffer(prims, BUFFER_USAGE.STORAGE);
+  const bd = device.createBuffer({ size, usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.COPY_SRC }), br = device.createBuffer({ size, usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST });
   const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bu } }, { binding: 1, resource: { buffer: bd } }, { binding: 2, resource: { buffer: bp } }] });
   const e = device.createCommandEncoder(), c = e.beginComputePass();
   c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, NZ / 4); c.end();
   e.copyBufferToBuffer(bd, 0, br, 0, size);
-  Q.submit([e.finish()]);
+  gpuQueue.submit([e.finish()]);
   await br.mapAsync(GPUMapMode.READ);
   D = new Float32Array(br.getMappedRange().slice(0));
   br.unmap(); br.destroy(); bd.destroy();
@@ -196,23 +200,23 @@ let D;
   for (const i of L) if (!R[i]) D[i] = -D[i];
 }
 // Distance to the rock for resolveCameraCollisions(), in 1/127 m (> 0 in rock, clamped to ±1 m), kept only in the 4x4x4-voxel
-// bricks near the surface within the camera's reach (~2 MB). CI per brick: 0 all water, 1 all rock, n brick n-2 in CG.
-const CO = 52, CN = 102, CI = new Uint16Array(CN * CN * NY / 4);
-let CG = new Int8Array(64 * 65534);
+// bricks near the surface within the camera's reach (~2 MB). collisionBrickLookup per brick: 0 all water, 1 all rock, n brick n-2 in collisionBrickData.
+const collisionGridOffset = 52, collisionBrickCountPerAxis = 102, collisionBrickLookup = new Uint16Array(collisionBrickCountPerAxis * collisionBrickCountPerAxis * NY / 4);
+let collisionBrickData = new Int8Array(64 * 65534);
 {
   let n = 0;
-  for (let bz = 0; bz < CN; bz++) for (let by = 1; by < NY / 4 - 1; by++) for (let bx = 0; bx < CN; bx++) {
-    if (hypot(bx - CN / 2 + 0.5, bz - CN / 2 + 0.5) > 52) continue; // more than 156 m out: never reached
+  for (let bz = 0; bz < collisionBrickCountPerAxis; bz++) for (let by = 1; by < NY / 4 - 1; by++) for (let bx = 0; bx < collisionBrickCountPerAxis; bx++) {
+    if (hypot(bx - collisionBrickCountPerAxis / 2 + 0.5, bz - collisionBrickCountPerAxis / 2 + 0.5) > 52) continue; // more than 156 m out: never reached
     let lo = 127, hi = -127;
     for (let z = 0; z < 4; z++) for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
-      const i = CO + bx * 4 + x + NX * (by * 4 + y + NY * (CO + bz * 4 + z)), gz = D[i + NX * NY] - D[i - NX * NY];
+      const i = collisionGridOffset + bx * 4 + x + NX * (by * 4 + y + NY * (collisionGridOffset + bz * 4 + z)), gz = D[i + NX * NY] - D[i - NX * NY];
       const gx = D[i + 1] - D[i - 1], g = D[i + NX] - D[i - NX], l = sqrt(gx * gx + g * g + gz * gz) / 1.5;
       const q = round(clamp(D[i] / max(l, 0.05), -1, 1) * 127);
-      CG[n * 64 + x + 4 * y + 16 * z] = q; if (q < lo) lo = q; if (q > hi) hi = q;
+      collisionBrickData[n * 64 + x + 4 * y + 16 * z] = q; if (q < lo) lo = q; if (q > hi) hi = q;
     }
-    CI[bx + CN * (by + NY / 4 * bz)] = lo === hi && lo * lo === 16129 ? +(lo > 0) : (n++, n + 1);
+    collisionBrickLookup[bx + collisionBrickCountPerAxis * (by + NY / 4 * bz)] = lo === hi && lo * lo === 16129 ? +(lo > 0) : (n++, n + 1);
   }
-  CG = CG.slice(0, n * 64);
+  collisionBrickData = collisionBrickData.slice(0, n * 64);
 }
 await reportLoadingProgress('Carving canyons…', 0.32, 400);
 const T = extractTerrainMesh(D);
@@ -313,19 +317,19 @@ let nV = 0, nI = 0;
 for (const m of meshes) { m.v0 = nV; m.i0 = nI; nV += m.nv; nI += m.ib.length; }
 const allV = new Uint8Array(nV * 16), allI = new Uint32Array(nI);
 for (const m of meshes) { allV.set(new Uint8Array(m.vb), m.v0 * 16); allI.set(m.ib, m.i0); }
-const vbMesh = uploadGpuBuffer(allV, BU.VERTEX), ibMesh = uploadGpuBuffer(allI, BU.INDEX);
-const vbTerrain = uploadGpuBuffer(new Uint8Array(T.vb), BU.VERTEX), ibTerrain = uploadGpuBuffer(T.ib, BU.INDEX);
+const vbMesh = uploadGpuBuffer(allV, BUFFER_USAGE.VERTEX), ibMesh = uploadGpuBuffer(allI, BUFFER_USAGE.INDEX);
+const vbTerrain = uploadGpuBuffer(new Uint8Array(T.vb), BUFFER_USAGE.VERTEX), ibTerrain = uploadGpuBuffer(T.ib, BUFFER_USAGE.INDEX);
 const nSolid = worldData.solids.data.length / 12;
 const solidData = new Float32Array((nSolid + 1) * 12); solidData.set(worldData.solids.data); solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
-const ibSolids = uploadGpuBuffer(solidData, BU.VERTEX);
-const ibChunk = worldData.chunks.map((c) => uploadGpuBuffer(c.data, BU.VERTEX)), ibProp = worldData.props.map((c) => uploadGpuBuffer(c.data, BU.VERTEX));
-const ibBig = uploadGpuBuffer(new Uint8Array(worldData.big.uploadGpuBuffer), BU.VERTEX), ibBigF = uploadGpuBuffer(new Uint8Array(worldData.bigF.uploadGpuBuffer), BU.VERTEX), ibSmall = uploadGpuBuffer(new Uint8Array(worldData.small.uploadGpuBuffer), BU.VERTEX);
-const ibFish = uploadGpuBuffer(worldData.fish, BU.VERTEX), ibManta = uploadGpuBuffer(worldData.mantas, BU.VERTEX), ibBubbles = uploadGpuBuffer(worldData.bubbles, BU.VERTEX), ibSnowB = uploadGpuBuffer(worldData.snow, BU.VERTEX);
-const ibGl = uploadGpuBuffer(worldData.glints, BU.VERTEX), nGl = worldData.glints.length / 8;
+const ibSolids = uploadGpuBuffer(solidData, BUFFER_USAGE.VERTEX);
+const ibChunk = worldData.chunks.map((c) => uploadGpuBuffer(c.data, BUFFER_USAGE.VERTEX)), ibProp = worldData.props.map((c) => uploadGpuBuffer(c.data, BUFFER_USAGE.VERTEX));
+const ibBig = uploadGpuBuffer(new Uint8Array(worldData.big.uploadGpuBuffer), BUFFER_USAGE.VERTEX), ibBigF = uploadGpuBuffer(new Uint8Array(worldData.bigF.uploadGpuBuffer), BUFFER_USAGE.VERTEX), ibSmall = uploadGpuBuffer(new Uint8Array(worldData.small.uploadGpuBuffer), BUFFER_USAGE.VERTEX);
+const ibFish = uploadGpuBuffer(worldData.fish, BUFFER_USAGE.VERTEX), ibManta = uploadGpuBuffer(worldData.mantas, BUFFER_USAGE.VERTEX), ibBubbles = uploadGpuBuffer(worldData.bubbles, BUFFER_USAGE.VERTEX), ibSnowB = uploadGpuBuffer(worldData.snow, BUFFER_USAGE.VERTEX);
+const ibGl = uploadGpuBuffer(worldData.glints, BUFFER_USAGE.VERTEX), nGl = worldData.glints.length / 8;
 const nFish = worldData.fish.length / 8, nManta = worldData.mantas.length / 8, nBub = worldData.bubbles.length / 8, nSnow = worldData.snow.length / 4;
 const mantaMesh = meshes[12], fishMesh = meshes[13];
-Q.writeTexture({ texture: occlusionVolumeTexture }, worldData.volD, { bytesPerRow: NX, rowsPerImage: NY / 2 }, [NX / 2, NY / 2, NZ / 2]);
-Q.writeTexture({ texture: mapTexture }, worldData.gm, { bytesPerRow: 2048 }, [512, 512]);
+gpuQueue.writeTexture({ texture: occlusionVolumeTexture }, worldData.volD, { bytesPerRow: NX, rowsPerImage: NY / 2 }, [NX / 2, NY / 2, NZ / 2]);
+gpuQueue.writeTexture({ texture: mapTexture }, worldData.gm, { bytesPerRow: 2048 }, [512, 512]);
 
 // ---------------------------------------------------------------- one-time bakes: detail texture, shadow map
 {
@@ -335,21 +339,21 @@ Q.writeTexture({ texture: mapTexture }, worldData.gm, { bytesPerRow: 2048 }, [51
   r.setPipeline(p); r.draw(3); r.end();
   for (let i = 1; i < 11; i++) {
     r = e.beginRenderPass({ colorAttachments: [createColorAttachment(detailTexture.createView({ baseMipLevel: i, mipLevelCount: 1 }), true)] });
-    r.setPipeline(pMip8); r.setBindGroup(0, createBlitBindGroup(detailTexture.createView({ baseMipLevel: i - 1, mipLevelCount: 1 }))); r.draw(3); r.end();
+    r.setPipeline(detailMipmapPipeline); r.setBindGroup(0, createBlitBindGroup(detailTexture.createView({ baseMipLevel: i - 1, mipLevelCount: 1 }))); r.draw(3); r.end();
   }
   r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: shadowTexture.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
   r.setBindGroup(0, shadowBindGroup);
-  r.setPipeline(pTerrSh);
+  r.setPipeline(terrainShadowPipeline);
   r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
   r.drawIndexed(T.ib.length, 1, 0, 0, nSolid);
-  r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
+  r.setPipeline(solidShadowPipeline); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
   for (let i = 0; i < 12; i++) { const g = worldData.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
   // small rocks, sponges and corals (~35M triangles) only on High: too much for a phone's driver
   if (!LV) for (let i = 0; i < NCHUNK; i++) { r.setVertexBuffer(1, ibChunk[i]); r.drawIndexed(meshes[14 + i].ib.length, worldData.chunks[i].n, meshes[14 + i].i0, meshes[14 + i].v0, 0); }
   if (!LV) for (let i = 0; i < 6; i++) if (worldData.props[i].n) { r.setVertexBuffer(1, ibProp[i]); r.drawIndexed(meshes[4 + i].ib.length, worldData.props[i].n, meshes[4 + i].i0, meshes[4 + i].v0, 0); }
-  r.setPipeline(pLeafSh); r.setVertexBuffer(0, ibBig); r.draw(6, worldData.big.n);
+  r.setPipeline(leafShadowPipeline); r.setVertexBuffer(0, ibBig); r.draw(6, worldData.big.n);
   r.end();
-  Q.submit([e.finish()]);
+  gpuQueue.submit([e.finish()]);
 }
 // the GPU has its own copies now: let go of the generator's (about 300 MB)
 for (const o of [worldData.big, worldData.bigF, worldData.small, ...worldData.chunks, ...worldData.props]) o.uploadGpuBuffer = o.data = 0;
@@ -369,24 +373,24 @@ function resize() {
   if (w === W && h === H) return;
   dynN = dynG = dynGN = 0; dynT = -300; // let the new size settle before measuring again
   W = w; H = h; canvas.width = W; canvas.height = H;
-  ctx.configure({ device, format: FMT, alphaMode: 'opaque' });
+  gpuCanvasContext.configure({ device, format: CANVAS_FORMAT, alphaMode: 'opaque' });
   for (const t of targets) t.destroy();
-  const tMS = createGpuTexture(AA > 1 ? W : 1, H, HDR, TU.RENDER_ATTACHMENT, { samples: AA }), tDp = createGpuTexture(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { samples: AA });
-  const tRes = createGpuTexture(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay = createGpuTexture(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = createGpuTexture(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
+  const tMS = createGpuTexture(AA > 1 ? W : 1, H, HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT, { samples: AA }), tDp = createGpuTexture(W, H, DEPTH_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING, { samples: AA });
+  const tRes = createGpuTexture(W, H, HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING), tRay = createGpuTexture(W / 2, H / 2, HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING), tRay2 = createGpuTexture(W / 2, H / 2, HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING);
   targets = [tMS, tDp, tRes, tRay, tRay2];
   const bl = [];
-  for (let i = 0; i < NB; i++) { const t = createGpuTexture(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING); bl.push(t); targets.push(t); }
+  for (let i = 0; i < NB; i++) { const t = createGpuTexture(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR_COLOR_FORMAT, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING); bl.push(t); targets.push(t); }
   const vDp = tDp.createView(), vRes = tRes.createView(), vRay = tRay.createView(), vRay2 = tRay2.createView(), vBl = bl.map((t) => t.createView());
   // without anti-aliasing (Low) the scene goes straight into the resolve target, and tMS is one unused column
   passScene = { colorAttachments: [{ view: AA > 1 ? tMS.createView() : vRes, resolveTarget: AA > 1 ? vRes : undefined, loadOp: 'clear', storeOp: AA > 1 ? 'discard' : 'store', clearValue: [0, 0, 0, 1] }],
     depthStencilAttachment: { view: vDp, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
   passRays = { colorAttachments: [createColorAttachment(vRay, true)] };
   passBlur = { colorAttachments: [createColorAttachment(vRay2, true)] };
-  bgBlur = device.createBindGroup({ layout: pRB.getBindGroupLayout(0), entries: [{ binding: 0, resource: vRay }] });
+  bgBlur = device.createBindGroup({ layout: rayBlurPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: vRay }] });
   passPost = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] };
-  bgRays = device.createBindGroup({ layout: pRays.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniformBuffer } }, { binding: 1, resource: repeatSampler }, { binding: 2, resource: shadowComparisonSampler },
+  bgRays = device.createBindGroup({ layout: volumetricRayPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniformBuffer } }, { binding: 1, resource: repeatSampler }, { binding: 2, resource: shadowComparisonSampler },
     { binding: 3, resource: shadowTexture.createView() }, { binding: 4, resource: waterTexture.createView() }, { binding: 5, resource: vDp }, { binding: 6, resource: occlusionVolumeTexture.createView() }, { binding: 7, resource: clampSampler }] });
-  bgPost = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniformBuffer } }, { binding: 1, resource: clampSampler }, { binding: 2, resource: vRes },
+  bgPost = device.createBindGroup({ layout: finalCompositePipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sceneUniformBuffer } }, { binding: 1, resource: clampSampler }, { binding: 2, resource: vRes },
     { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
   bloomPass = []; bloomBG = [];
   // down: res -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
@@ -401,9 +405,9 @@ addEventListener('resize', resize);
 let qs, qResolve, qRead = [], tsBegin, tsEnd;
 if (supportsGpuTimestamps) {
   qs = device.createQuerySet({ type: 'timestamp', count: 2 });
-  qResolve = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
+  qResolve = device.createBuffer({ size: 16, usage: BUFFER_USAGE.QUERY_RESOLVE | BUFFER_USAGE.COPY_SRC });
   for (let i = 0; i < 6; i++) {
-    const b = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
+    const b = device.createBuffer({ size: 16, usage: BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST });
     const o = { b, busy: false, done: null };
     o.done = () => {
       const a = new BigInt64Array(b.getMappedRange());
@@ -418,7 +422,7 @@ if (supportsGpuTimestamps) {
 // ---------------------------------------------------------------- frame
 let hud = false;
 let kf = 0, kb = 0, kl = 0, kr = 0, ku = 0, kd = 0, ks = 0, mdx = 0, mdy = 0, lkx = 0, lky = 0, l2x = 0, l2y = 0, hN = 0, hMax = 0, hMin = 1e9, hPer = 1e9, hLate = 0, hTot = 0, tId = -1, tN = 0, tx0 = 0, ty0 = 0, tx = 0, ty = 0;
-const TANH = 0.6, NEAR = 0.1, EXPO = 0.62, RAYS = 0.54;
+const verticalFovTangent = 0.6, nearClipDistance = 0.1, exposureStrength = 0.62, rayStrength = 0.54;
 const submitList = [null];
 const rowsNearToFar = new Uint8Array(CELLS);
 // Draws the cells of a cell-sorted buffer that are in view and within [minD, maxD) (scaled by `det`, but not for the
@@ -440,7 +444,7 @@ function drawVisibleCells(
   const maxDistanceSquared = farDistance * farDistance * scaleSquared;
   const halfCell = CELLW * 0.5;
   const expandedHalfCell = halfCell + padding;
-  const horizontalFov = TANH * W / H;
+  const horizontalFov = verticalFovTangent * W / H;
 
   for (let rowIndex = 0; rowIndex < CELLS; rowIndex++) {
     const gridRow = rowsNearToFar[rowIndex];
@@ -476,7 +480,7 @@ function drawVisibleCells(
               const up =
                 abs(relativeX * ux + relativeY * uy + relativeZ * uz)
                 - expandedHalfCell * (abs(ux) + abs(uz)) - halfHeight * abs(uy);
-              isVisible = up <= forward * TANH;
+              isVisible = up <= forward * verticalFovTangent;
             }
           }
         }
@@ -513,21 +517,21 @@ function render() {
   const cp = cos(pitch), fy = sin(pitch), rx = cos(yaw), rz = sin(yaw), fx = cp * rz, fz = -cp * rx;
   const ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
   F[FX] = fx; F[FY] = fy; F[FZ] = fz; F[RX] = rx; F[RZ] = rz; F[UX] = ux; F[UY] = uy; F[UZ] = uz;
-  const asp = W / H, sx = 1 / (TANH * asp), sy = 1 / TANH, m = sceneUniformValues;
+  const asp = W / H, sx = 1 / (verticalFovTangent * asp), sy = 1 / verticalFovTangent, m = sceneUniformValues;
   m[0] = rx * sx; m[4] = 0; m[8] = rz * sx; m[12] = -(rx * cx + rz * cz) * sx;
   m[1] = ux * sy; m[5] = uy * sy; m[9] = uz * sy; m[13] = -(ux * cx + uy * cy + uz * cz) * sy;
-  m[2] = 0; m[6] = 0; m[10] = 0; m[14] = NEAR;
+  m[2] = 0; m[6] = 0; m[10] = 0; m[14] = nearClipDistance;
   m[3] = fx; m[7] = fy; m[11] = fz; m[15] = -(fx * cx + fy * cy + fz * cz);
   m[32] = cx; m[33] = cy; m[34] = cz; m[35] = F[TIME];
-  m[36] = rx; m[37] = 0; m[38] = rz; m[39] = TANH * asp;
-  m[40] = ux; m[41] = uy; m[42] = uz; m[43] = TANH;
-  m[44] = fx; m[45] = fy; m[46] = fz; m[47] = NEAR;
+  m[36] = rx; m[37] = 0; m[38] = rz; m[39] = verticalFovTangent * asp;
+  m[40] = ux; m[41] = uy; m[42] = uz; m[43] = verticalFovTangent;
+  m[44] = fx; m[45] = fy; m[46] = fz; m[47] = nearClipDistance;
   const zx = cx - PURPLE[0], zz = cz - PURPLE[1]; let zt = (44 - sqrt(zx * zx + zz * zz)) / 18; zt = zt < 0 ? 0 : zt > 1 ? 1 : zt;
   m[51] = zt * zt * (3 - 2 * zt);
   let ek = (-cy - 8) / 26; ek = ek < 0 ? 0 : ek > 1 ? 1 : ek;
-  m[56] = EXPO * (0.6 + 0.4 * ek); m[57] = RAYS; m[58] = det;
-  Q.writeBuffer(sceneUniformBuffer, 0, sceneUniformValues);
-  waterUniformValues[0] = F[TIME]; Q.writeBuffer(waterUniformBuffer, 0, waterUniformValues);
+  m[56] = exposureStrength * (0.6 + 0.4 * ek); m[57] = rayStrength; m[58] = det;
+  gpuQueue.writeBuffer(sceneUniformBuffer, 0, sceneUniformValues);
+  waterUniformValues[0] = F[TIME]; gpuQueue.writeBuffer(waterUniformBuffer, 0, waterUniformValues);
 
   { let cr = floor((cz - OZ) / CELLW) | 0; cr = cr < 0 ? 0 : cr > CELLS - 1 ? CELLS - 1 : cr; let n = 0; rowsNearToFar[n++] = cr; for (let d = 1; d < CELLS; d++) { if (cr - d >= 0) rowsNearToFar[n++] = cr - d; if (cr + d < CELLS) rowsNearToFar[n++] = cr + d; } }
   const e = device.createCommandEncoder();
@@ -536,14 +540,14 @@ function render() {
   waterPass[0].timestampWrites = slot ? tsBegin : undefined;
   passPost.timestampWrites = slot ? tsEnd : undefined;
   // animated water texture + mips
-  let r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
-  for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
+  let r = e.beginRenderPass(waterPass[0]); r.setPipeline(waterAnimationPipeline); r.setBindGroup(0, bgWater); r.draw(3); r.end();
+  for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(waterMipmapPipeline); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
   // scene
   r = e.beginRenderPass(passScene);
   r.setBindGroup(0, sceneBindGroup);
-  r.setPipeline(pTerrain); r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
+  r.setPipeline(terrainPipeline); r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
   drawVisibleCells(r, T.start, T.lo, T.hi, 1.5, 1, 0, 0, 240);
-  r.setPipeline(pSolid); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
+  r.setPipeline(solidPipeline); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
   for (let i = 0; i < 12; i++) { const g = worldData.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
   for (let i = 0; i < NCHUNK; i++) {
     const c = worldData.chunks[i], big = i > 2 && i < 6; r.setVertexBuffer(1, ibChunk[i]);
@@ -555,57 +559,57 @@ function render() {
     drawVisibleCells(r, worldData.props[i].start, worldData.props[i].lo, worldData.props[i].hi, 3, meshes[4 + i], 0, 0, lod ? 6 : 110);
     if (lod) drawVisibleCells(r, worldData.props[i].start, worldData.props[i].lo, worldData.props[i].hi, 3, meshes[18 + i], 0, 6, 110);
   }
-  r.setPipeline(pManta); r.setVertexBuffer(1, ibManta); r.drawIndexed(mantaMesh.ib.length, nManta, mantaMesh.i0, mantaMesh.v0, 0);
-  r.setPipeline(pFish); r.setVertexBuffer(1, ibFish); r.drawIndexed(fishMesh.ib.length, nFish, fishMesh.i0, fishMesh.v0, 0);
+  r.setPipeline(mantaPipeline); r.setVertexBuffer(1, ibManta); r.drawIndexed(mantaMesh.ib.length, nManta, mantaMesh.i0, mantaMesh.v0, 0);
+  r.setPipeline(fishPipeline); r.setVertexBuffer(1, ibFish); r.drawIndexed(fishMesh.ib.length, nFish, fishMesh.i0, fishMesh.v0, 0);
   // kelp and plants: 9-row blades up close, 5 rows mid-range, a decimated set far away
-  r.setPipeline(pLeaf); r.setVertexBuffer(0, ibBig); drawVisibleCells(r, worldData.big.start, worldData.big.lo, worldData.big.hi, 5, false, 18, 0, 24);
-  r.setPipeline(pLeaf5); drawVisibleCells(r, worldData.big.start, worldData.big.lo, worldData.big.hi, 5, false, 10, 24, 58);
-  r.setPipeline(pLeafF); r.setVertexBuffer(0, ibBigF); drawVisibleCells(r, worldData.bigF.start, worldData.bigF.lo, worldData.bigF.hi, 5, false, 6, 58, 150);
-  r.setPipeline(pLeafS); r.setVertexBuffer(0, ibSmall); drawVisibleCells(r, worldData.small.start, worldData.small.lo, worldData.small.hi, 1.5, false, 6, 0, 70);
-  r.setPipeline(pSurf); r.draw(4);
-  r.setPipeline(pBack); r.draw(4);
-  r.setPipeline(pBub); r.setVertexBuffer(0, ibBubbles); r.draw(4, nBub);
-  r.setPipeline(pGl); r.setVertexBuffer(0, ibGl); r.draw(4, nGl);
-  r.setPipeline(pSnow); r.setVertexBuffer(0, ibSnowB); r.draw(4, nSnow);
+  r.setPipeline(nearKelpPipeline); r.setVertexBuffer(0, ibBig); drawVisibleCells(r, worldData.big.start, worldData.big.lo, worldData.big.hi, 5, false, 18, 0, 24);
+  r.setPipeline(midKelpPipeline); drawVisibleCells(r, worldData.big.start, worldData.big.lo, worldData.big.hi, 5, false, 10, 24, 58);
+  r.setPipeline(farKelpPipeline); r.setVertexBuffer(0, ibBigF); drawVisibleCells(r, worldData.bigF.start, worldData.bigF.lo, worldData.bigF.hi, 5, false, 6, 58, 150);
+  r.setPipeline(smallPlantPipeline); r.setVertexBuffer(0, ibSmall); drawVisibleCells(r, worldData.small.start, worldData.small.lo, worldData.small.hi, 1.5, false, 6, 0, 70);
+  r.setPipeline(waterSurfacePipeline); r.draw(4);
+  r.setPipeline(backgroundPipeline); r.draw(4);
+  r.setPipeline(bubblePipeline); r.setVertexBuffer(0, ibBubbles); r.draw(4, nBub);
+  r.setPipeline(glintPipeline); r.setVertexBuffer(0, ibGl); r.draw(4, nGl);
+  r.setPipeline(snowPipeline); r.setVertexBuffer(0, ibSnowB); r.draw(4, nSnow);
   r.end();
   // light shafts
-  r = e.beginRenderPass(passRays); r.setPipeline(pRays); r.setBindGroup(0, bgRays); r.draw(3); r.end();
-  r = e.beginRenderPass(passBlur); r.setPipeline(pRB); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
+  r = e.beginRenderPass(passRays); r.setPipeline(volumetricRayPipeline); r.setBindGroup(0, bgRays); r.draw(3); r.end();
+  r = e.beginRenderPass(passBlur); r.setPipeline(rayBlurPipeline); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
   // bloom
   for (let i = 0; i < bloomPass.length; i++) {
-    r = e.beginRenderPass(bloomPass[i]); r.setPipeline(i === 0 ? pDown0 : i < NB ? pDown : pUp); r.setBindGroup(0, bloomBG[i]); r.draw(3); r.end();
+    r = e.beginRenderPass(bloomPass[i]); r.setPipeline(i === 0 ? firstBloomDownsamplePipeline : i < NB ? bloomDownsamplePipeline : bloomUpsamplePipeline); r.setBindGroup(0, bloomBG[i]); r.draw(3); r.end();
   }
   // composite
-  passPost.colorAttachments[0].view = ctx.getCurrentTexture().createView();
-  r = e.beginRenderPass(passPost); r.setPipeline(pPost); r.setBindGroup(0, bgPost); r.draw(3); r.end();
+  passPost.colorAttachments[0].view = gpuCanvasContext.getCurrentTexture().createView();
+  r = e.beginRenderPass(passPost); r.setPipeline(finalCompositePipeline); r.setBindGroup(0, bgPost); r.draw(3); r.end();
   if (slot) { e.resolveQuerySet(qs, 0, 2, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16); }
   submitList[0] = e.finish();
-  Q.submit(submitList);
+  gpuQueue.submit(submitList);
   if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done); }
 }
 
-// CS[j] = distance to the rock (metres, < 0 in water) at the camera + CE[3j..3j+2]: the camera, then ±0.375 m on
+// collisionSampleValues[j] = distance to the rock (metres, < 0 in water) at the camera + collisionSampleOffsets[3j..3j+2]: the camera, then ±0.375 m on
 // each axis for the gradient
-const CE = new Float64Array([0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375]), CS = new Float64Array(7);
-// CI contains either a uniform-brick marker (0 water, 1 rock) or an
-// index (>=2) into the packed 4×4×4 signed-distance bricks in CG.
+const collisionSampleOffsets = new Float64Array([0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375]), collisionSampleValues = new Float64Array(7);
+// collisionBrickLookup contains either a uniform-brick marker (0 water, 1 rock) or an
+// index (>=2) into the packed 4×4×4 signed-distance bricks in collisionBrickData.
 function readCollisionVoxel(x, y, z) {
-  const brick = CI[(x >> 2) + CN * ((y >> 2) + (NY / 4) * (z >> 2))];
+  const brick = collisionBrickLookup[(x >> 2) + collisionBrickCountPerAxis * ((y >> 2) + (NY / 4) * (z >> 2))];
   if (brick <= 1) return brick * 254 - 127;
   const withinBrick = (x & 3) + 4 * (y & 3) + 16 * (z & 3);
-  return CG[(brick - 2) * 64 + withinBrick];
+  return collisionBrickData[(brick - 2) * 64 + withinBrick];
 }
 // Trilinearly interpolate the compact 4×4×4 collision bricks.
 // Result is positive inside rock and negative in open water.
 function sampleRockDistance(j) {
-  const x = (F[CX] + CE[j * 3] - OX) / VS - CO, y = (F[CY] + CE[j * 3 + 1] - OY) / VS, z = (F[CZ] + CE[j * 3 + 2] - OZ) / VS - CO;
+  const x = (F[CX] + collisionSampleOffsets[j * 3] - OX) / VS - collisionGridOffset, y = (F[CY] + collisionSampleOffsets[j * 3 + 1] - OY) / VS, z = (F[CZ] + collisionSampleOffsets[j * 3 + 2] - OZ) / VS - collisionGridOffset;
   const ix = x | 0, iy = y | 0, iz = z | 0, u = x - ix, v = y - iy, a = readCollisionVoxel(ix, iy, iz), b = readCollisionVoxel(ix, iy + 1, iz), c = readCollisionVoxel(ix, iy, iz + 1), d = readCollisionVoxel(ix, iy + 1, iz + 1);
   const p = a + (readCollisionVoxel(ix + 1, iy, iz) - a) * u, q = b + (readCollisionVoxel(ix + 1, iy + 1, iz) - b) * u, r = c + (readCollisionVoxel(ix + 1, iy, iz + 1) - c) * u, s = d + (readCollisionVoxel(ix + 1, iy + 1, iz + 1) - d) * u;
-  const e = p + (q - p) * v; CS[j] = (e + (r + (s - r) * v - e) * (z - iz)) / 127;
+  const e = p + (q - p) * v; collisionSampleValues[j] = (e + (r + (s - r) * v - e) * (z - iz)) / 127;
 }
-// Moves the camera by F[MX..MZ] in steps shorter than its radius CR (so it can't pass through thin rock), pushing it
+// Moves the camera by F[MX..MZ] in steps shorter than its radius cameraCollisionRadius (so it can't pass through thin rock), pushing it
 // back out after each step and dropping velocity into the rock, so it slides along.
-const CR = 0.5;
+const cameraCollisionRadius = 0.5;
 // Small substeps prevent tunneling; project velocity onto the tangent plane
 // when pushing out of rock, so the camera slides rather than sticking.
 function resolveCameraCollisions() {
@@ -613,9 +617,9 @@ function resolveCameraCollisions() {
   for (let i = 0; i < n; i++) {
     F[CX] += F[MX] / n; F[CY] += F[MY] / n; F[CZ] += F[MZ] / n;
     for (let k = 0; k < 2; k++) {
-      sampleRockDistance(0); const s = CS[0] + CR; if (s <= 0) break;
+      sampleRockDistance(0); const s = collisionSampleValues[0] + cameraCollisionRadius; if (s <= 0) break;
       for (let j = 1; j < 7; j++) sampleRockDistance(j);
-      let gx = CS[1] - CS[2], gy = CS[3] - CS[4], gz = CS[5] - CS[6]; const l = sqrt(gx * gx + gy * gy + gz * gz);
+      let gx = collisionSampleValues[1] - collisionSampleValues[2], gy = collisionSampleValues[3] - collisionSampleValues[4], gz = collisionSampleValues[5] - collisionSampleValues[6]; const l = sqrt(gx * gx + gy * gy + gz * gz);
       if (l < 0.075) break; // flat: deep in rock
       gx /= l; gy /= l; gz /= l; const vn = F[VX] * gx + F[VY] * gy + F[VZ] * gz;
       F[CX] -= gx * s; F[CY] -= gy * s; F[CZ] -= gz * s;
@@ -842,7 +846,7 @@ document.addEventListener('pointerlockchange', () => ui(!document.pointerLockEle
 // draw the first frame and wait for the GPU to finish it (pipelines get compiled on first use) before the reveal
 lookAt(...POSES[0]);
 await reportLoadingProgress('Letting the light in…', 1, 400);
-render(); await Q.onSubmittedWorkDone();
+render(); await gpuQueue.onSubmittedWorkDone();
 setTimeout(keep, 15e3, 'abyssalLoad', ''); // the load counts as survived after 15 s of frames
 ui(true);
 requestAnimationFrame((t) => { F[LAST] = t; requestAnimationFrame(frame); });
