@@ -71,7 +71,7 @@ If loading crashes the tab, or the graphics driver gives up, the page starts aga
 
 ## Make it your own
 
-The readable source code is in the [`source`](source) folder. To change something and rebuild `index.html` you need [Node.js](https://nodejs.org) 18 or newer:
+The readable source code is in the [`source`](source) folder. For a tour of how the renderer works, see the [architecture and shader guide](docs/ARCHITECTURE.md). To change something and rebuild `index.html` you need [Node.js](https://nodejs.org) 18 or newer:
 
 ```bash
 cd source
@@ -85,8 +85,11 @@ This writes a new `index.html` next to this README. `npm run build:readable` wri
 
 | File | What's inside |
 |---|---|
-| [`source/src/world.js`](source/src/world.js) | The world layout: rock walls, arches, tunnels, kelp forests, sponge gardens, fish schools, mantas, the ship and the whale tail. **A good place to start.** |
-| [`source/src/shaders.js`](source/src/shaders.js) | The look: water and fog colors, lighting, kelp, rocks, the water surface and light rays (WGSL shader code) |
+| [`source/src/world-layout.js`](source/src/world-layout.js) | Hand-authored locations of rock walls, arches, tunnels and regional controls. **A good place to start.** |
+| [`source/src/world.js`](source/src/world.js) | Mesh extraction and procedural content: kelp, sponge gardens, fish schools, mantas, ship and whale tail. |
+| [`source/src/shaders-terrain.js`](source/src/shaders-terrain.js) | Noise, GPU terrain density, procedural detail and animated water texture. |
+| [`source/src/shaders-scene.js`](source/src/shaders-scene.js) | Fog, light absorption, solid materials, kelp, fish, water surface and particles (WGSL). |
+| [`source/src/shaders-post.js`](source/src/shaders-post.js) | Volumetric light rays, depth-aware blur, bloom composite and tone mapping (WGSL). |
 | [`source/src/main.js`](source/src/main.js) | The renderer, the camera, the controls, the six viewpoints and the camera path the world is laid out around |
 | [`source/src/audio.js`](source/src/audio.js) | The soundscape |
 | [`source/src/quality.js`](source/src/quality.js) | The detail levels: which one a device starts on, and what is remembered between visits |
@@ -96,7 +99,7 @@ This writes a new `index.html` next to this README. `npm run build:readable` wri
 
 Some easy first tweaks:
 
-- **Water color:** `WCOL` (blue-green water) and `PCOL` (purple grotto) near the top of the shared scene code in `shaders.js`
+- **Water color:** `WCOL` (blue-green water) and `PCOL` (purple grotto) near the top of the shared scene code in `shaders-scene.js`
 - **Sunlight color:** `SUNC` right next to them
 - **Brightness and light rays:** `EXPO` and `RAYS` in `main.js`
 - **Swimming speed:** search for `26 : 7` in `main.js` (fast speed : normal speed)
