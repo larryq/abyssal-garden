@@ -9,7 +9,12 @@ import { fileURLToPath } from 'node:url';
 import { transformSync } from 'esbuild';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FILES = ['quality.js', 'math.js', 'shaders.js', 'world.js', 'main.js', 'audio.js']; // concatenation order matters
+const FILES = [
+  'quality.js', 'math.js',
+  // All shader variables are global bindings in the one generated async scope.
+  'shaders.js', 'shaders-terrain.js', 'shaders-scene.js', 'shaders-post.js',
+  'world-layout.js', 'world.js', 'main.js', 'audio.js',
+]; // concatenation order matters
 const dev = process.argv.includes('--dev'), readable = dev || process.argv.includes('--readable');
 const out = dev ? 'dev.html' : 'index.html';
 if (dev) FILES.push('dev.js');
