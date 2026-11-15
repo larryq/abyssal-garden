@@ -42,7 +42,10 @@ const magAt = (x, z) => {
   return m * sstep(0.3, 0.55, fbm(x * 0.17, 1, z * 0.17, 2) + m * 0.25);
 };
 
-function primBuffer() {
+// Pack the authored mesa/arch/tunnel/clearance controls into float records.
+// The density compute shader expects two vec4<f32> values per primitive, in
+// exactly this order; keep the data layout aligned with W_DENS.
+function packTerrainPrimitives() {
   const a = [];
   for (const m of MESAS) a.push(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
   for (const m of ARCHES) a.push(m[0], m[1], m[2], m[3], m[4], m[5], m[6], 0);
