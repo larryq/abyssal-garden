@@ -176,11 +176,13 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
       const type = kind === 1
         ? (random01() < 0.8 ? 3 : 4)
         : kind === 2 ? (random01() < 0.5 ? 4 : 0) : 0;
+      // Draw yaw before width to preserve the original seeded PRNG order.
+      const bladeYaw = random01() * TAU;
       const width = bladeLength * (
         kind === 1 ? randomRange(0.09, 0.13) : randomRange(0.15, 0.21)
       ) + 0.03;
       addLeaf(big, position[0], y + stemHeight, position[1],
-        bladeLength, random01() * TAU, tilt, width,
+        bladeLength, bladeYaw, tilt, width,
         stemHeight, type, random01(), random01(), randomRange(0.38, 0.95));
     }
 
