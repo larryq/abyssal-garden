@@ -43,34 +43,43 @@ function extractTerrainMesh(D) {
 // coral and wildlife are grouped into spatial cells for inexpensive instancing.
 // The seeded random streams keep separate content families reproducible.
 function populateProceduralWorld(D, T, flyPts, POSES) {
-  const gi = (x, y, z) => x + NX * (y + NY * z);
-  const smp = T.smp;
-  const Dw = (x, y, z) => smp((x - OX) / VS, (y - OY) / VS, (z - OZ) / VS);
+  // Density array is X-fastest, then Y, then Z. World coordinates are
+  // transformed to voxel coordinates only at sampling boundaries.
+  const densityGridIndex = (x, y, z) => x + NX * (y + NY * z);
+  const sampleDensityGrid = T.smp;
+  const sampleWorldDensity = (x, y, z) =>
+    sampleDensityGrid((x - OX) / VS, (y - OY) / VS, (z - OZ) / VS);
   const nCells = CELLS * CELLS;
   // 16×16 X/Z grid: instance groups are culled and drawn in whole-cell runs.
-  const cellOf = (x, z) => clamp(floor((x - OX) / CELLW), 0, CELLS - 1) + CELLS * clamp(floor((z - OZ) / CELLW), 0, CELLS - 1);
+  const worldCellIndex = (x, z) => {
+    const cellX = clamp(floor((x - OX) / CELLW), 0, CELLS - 1);
+    const cellZ = clamp(floor((z - OZ) / CELLW), 0, CELLS - 1);
+    return cellX + CELLS * cellZ;
+  };
   const big = Array.from({ length: nCells }, () => []), small = Array.from({ length: nCells }, () => []);
-  // Medium and Low keep every 2nd / 4th addLeaf (but every kelp stem), made wider; the random stream is the same
+  // Medium and Low keep every 2nd / 4th leaf (but every kelp stem), made wider; the random stream is the same
   let nth = 0;
-  // Packed addLeaf layout: position (3), length, yaw, tilt, width, stem height,
+  // Packed leaf layout: position (3), length, yaw, tilt, width, stem height,
   // plant type, two animation seeds and bend amplitude (12 floats total).
   // Stems (type 1) are never thinned; other blades are thinned by quality level.
   const addLeaf = (cells, x, y, z, length, yaw, tilt, width, stemHeight, type, seed1, seed2, bend) => {
     if (type !== 1 && (nth++ % THIN)) return;
-    cells[cellOf(x, z)].push(
+    cells[worldCellIndex(x, z)].push(
       x, y, z, length, yaw, tilt,
       type === 1 ? width : width * (1 + LV / 2),
       stemHeight, type, seed1, seed2, bend
     );
   };
-  const glint = (...a) => { nth++ % THIN || glints.push(...a); };
+  const addGlint = (...attributes) => {
+    if (!(nth++ % THIN)) glints.push(...attributes);
+  };
   const solids = []; // per mesh id: arrays of 12 floats
   const props = Array.from({ length: 6 }, () => Array.from({ length: nCells }, () => []));
-  // Each addSolidInstance instance is twelve floats: position, scale, quaternion (xyzw),
+  // Each solid instance is twelve floats: position, scale, quaternion (xyzw),
   // material ID, random seed, animation speed and bobbing amplitude.
   const addSolidInstance = (mesh, x, y, z, scale, orientation, material, seed, timeScale = 1, bob = 0) => {
     const store = mesh > 3 && mesh < 10
-      ? props[mesh - 4][cellOf(x, z)]
+      ? props[mesh - 4][worldCellIndex(x, z)]
       : (solids[mesh] ||= []);
     store.push(
       x, y, z, scale,
@@ -87,36 +96,37 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   // Density is positive in rock. Sampling and gradients place plants against
   // the true canyon/overhang surface rather than an approximate heightmap.
   const fl = [];
-  const floorsAt = (x, z) => {
+  const findVerticalSurfaces = (x, z) => {
     const ix = clamp(round((x - OX) / VS), 1, NX - 2), iz = clamp(round((z - OZ) / VS), 1, NZ - 2);
     fl.length = 0; let ceil = 3;
     for (let gy = NY - 2; gy >= 0; gy--) {
-      const d = D[gi(ix, gy, iz)], da = D[gi(ix, gy + 1, iz)];
+      const d = D[densityGridIndex(ix, gy, iz)], da = D[densityGridIndex(ix, gy + 1, iz)];
       if (da <= 0 && d > 0) { const y = OY + (gy + d / (d - da)) * VS; fl.push(y, min(ceil, 0) - y); } else if (da > 0 && d <= 0) ceil = OY + (gy + 0.5) * VS;
     }
     return fl;
   };
-  const grad = (x, y, z) => {
-    const e = 0.6; let nx = Dw(x - e, y, z) - Dw(x + e, y, z), ny = Dw(x, y - e, z) - Dw(x, y + e, z), nz = Dw(x, y, z - e) - Dw(x, y, z + e);
+  const densityNormal = (x, y, z) => {
+    const e = 0.6; let nx = sampleWorldDensity(x - e, y, z) - sampleWorldDensity(x + e, y, z), ny = sampleWorldDensity(x, y - e, z) - sampleWorldDensity(x, y + e, z), nz = sampleWorldDensity(x, y, z - e) - sampleWorldDensity(x, y, z + e);
     const l = hypot(nx, ny, nz) || 1; return [nx / l, ny / l, nz / l];
   };
   // march from outside along -n to the surface
-  const snap = (x, y, z, n) => {
-    let px = x + n[0] * 2.5, py = y + n[1] * 2.5, pz = z + n[2] * 2.5, prev = Dw(px, py, pz);
+  const projectOntoRockSurface = (x, y, z, n) => {
+    let px = x + n[0] * 2.5, py = y + n[1] * 2.5, pz = z + n[2] * 2.5, prev = sampleWorldDensity(px, py, pz);
     if (prev > 0) return null;
     for (let i = 0; i < 24; i++) {
-      const qx = px - n[0] * 0.25, qy = py - n[1] * 0.25, qz = pz - n[2] * 0.25, d = Dw(qx, qy, qz);
-      if (d > 0) { const t = prev / (prev - d); const p = [mix(px, qx, t), mix(py, qy, t), mix(pz, qz, t)]; return p.concat(grad(p[0], p[1], p[2])); }
+      const qx = px - n[0] * 0.25, qy = py - n[1] * 0.25, qz = pz - n[2] * 0.25, d = sampleWorldDensity(qx, qy, qz);
+      if (d > 0) { const t = prev / (prev - d); const p = [mix(px, qx, t), mix(py, qy, t), mix(pz, qz, t)]; return p.concat(densityNormal(p[0], p[1], p[2])); }
       px = qx; py = qy; pz = qz; prev = d;
     }
     return null;
   };
-  const pickV = () => ((random01() * T.nv) | 0) * 3;
-  const tangent = (n) => { let t = abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [1, 0, 0]; const l = hypot(...t); t = t.map((v) => v / l); return [t, [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]]]; };
-  const nearFly = (x, y, z, r) => { for (const p of flyPts) if (hypot(x - p[0], z - p[2]) < r && y < p[1] + 3 && y > p[1] - 13) return true; return false; };
-  const nearPose = (x, z, r = 3) => { for (const p of POSES) if (hypot(x - p[0], z - p[2]) < r) return true; return false; };
+  const pickRandomTerrainVertex = () => ((random01() * T.nv) | 0) * 3;
+  const surfaceTangentBasis = (n) => { let t = abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [1, 0, 0]; const l = hypot(...t); t = t.map((v) => v / l); return [t, [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]]]; };
+  const nearFlythroughPath = (x, y, z, r) => { for (const p of flyPts) if (hypot(x - p[0], z - p[2]) < r && y < p[1] + 3 && y > p[1] - 13) return true; return false; };
+  const nearPresetViewpoint = (x, z, r = 3) => { for (const p of POSES) if (hypot(x - p[0], z - p[2]) < r) return true; return false; };
   // --- kelp columns
-  const column = (x, y, z, H, kind, dens = 1) => {
+  // CPU code packs blade parameters; WGSL creates and animates the actual blade vertices.
+  const addKelpColumn = (x, y, z, H, kind, dens = 1) => {
     const strands = 2 + (random01() < 0.6) + (random01() < 0.3), ph = random01() * TAU, tw = randomRange(0.1, 0.28), sr = randomRange(0.2, 0.55), sc = randomRange(0.75, 1.25);
     const la = random01() * TAU, lm = randomRange(0, 0.11), full = randomRange(0.55, 1.3) * dens;
     const stem = (s, h) => { const a = ph + s * TAU / strands + h * tw, r = sr * (1 - 0.6 * h / H), ln = lm * h * h / H; return [x + cos(a) * r + cos(la) * ln, z + sin(a) * r + sin(la) * ln, a]; };
@@ -129,19 +139,19 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
       const type = kind === 1 ? (random01() < 0.8 ? 3 : 4) : kind === 2 ? (random01() < 0.5 ? 4 : 0) : 0;
       addLeaf(big, p[0], y + h, p[1], L, random01() * TAU, tilt, L * (kind === 1 ? randomRange(0.09, 0.13) : randomRange(0.15, 0.21)) + 0.03, h, type, random01(), random01(), randomRange(0.38, 0.95));
     }
-    for (let i = floor(H * (kind === 1 ? 16 : 13)); i > 0; i--) { const h = random01() * H, a = random01() * TAU, r = randomRange(0.15, 0.8) * (1 - 0.5 * h / H), ln = lm * h * h / H; glint(x + cos(a) * r + cos(la) * ln, y + h, z + sin(a) * r + sin(la) * ln, h, random01(), kind === 1 ? random01() : random01() * 0.6, randomRange(0.018, 0.05), 0); }
+    for (let i = floor(H * (kind === 1 ? 16 : 13)); i > 0; i--) { const h = random01() * H, a = random01() * TAU, r = randomRange(0.15, 0.8) * (1 - 0.5 * h / H), ln = lm * h * h / H; addGlint(x + cos(a) * r + cos(la) * ln, y + h, z + sin(a) * r + sin(la) * ln, h, random01(), kind === 1 ? random01() : random01() * 0.6, randomRange(0.018, 0.05), 0); }
     // light absorption footprint for the skylight bake
     const hx = round((x - OX) / VS / 2), hz = round((z - OZ) / VS / 2);
     for (let hy = floor((y - OY) / VS / 2); hy <= floor((y + H - OY) / VS / 2); hy++) {
       if (hy >= 0 && hy < NY / 2 && hx > 0 && hx < NX / 2 - 1 && hz > 0 && hz < NZ / 2 - 1) kelpAbs[hx + NX / 2 * (hy + NY / 2 * hz)] += 0.17;
     }
   };
-  const KELPZ = [[-32, -5, 13, 0.85], [0, -86, 46, 1], [72, -26, 27, 0.9], [-60, -4, 11, 0.8], [0, -36, 12, 0.55], [-17, -8, 6, 0.8], [15, -8, 6, 0.8], [-4, 120, 20, 0.4], [-45, -63, 15, 0.9], [62, -26, 12, 0.9], [-100, 70, 30, 0.8], [100, 60, 30, 0.8], [-95, -90, 32, 0.8], [105, -85, 30, 0.7]];
-  const NOKELP = [[-5, -106.5, 8], [4.6, -109.4, 10], [14.2, -112.3, 12], [-26, -100, 6], [-20.5, -101.7, 4.5], [-14.8, -104.5, 6], [-7.5, -107.8, 7], [4, 112, 11], [2, 4, 15], [42, 22, 12], [6, 78, 19], [-58, -16, 8], [9, -66, 9], [8, -76, 8]];
+  const KELP_REGIONS = [[-32, -5, 13, 0.85], [0, -86, 46, 1], [72, -26, 27, 0.9], [-60, -4, 11, 0.8], [0, -36, 12, 0.55], [-17, -8, 6, 0.8], [15, -8, 6, 0.8], [-4, 120, 20, 0.4], [-45, -63, 15, 0.9], [62, -26, 12, 0.9], [-100, 70, 30, 0.8], [100, 60, 30, 0.8], [-95, -90, 32, 0.8], [105, -85, 30, 0.7]];
+  const KELP_EXCLUSION_ZONES = [[-5, -106.5, 8], [4.6, -109.4, 10], [14.2, -112.3, 12], [-26, -100, 6], [-20.5, -101.7, 4.5], [-14.8, -104.5, 6], [-7.5, -107.8, 7], [4, 112, 11], [2, 4, 15], [42, 22, 12], [6, 78, 19], [-58, -16, 8], [9, -66, 9], [8, -76, 8]];
   const kelpDens = (x, z) => {
-    for (const p of NOKELP) if (hypot(x - p[0], z - p[1]) < p[2]) return 0;
+    for (const p of KELP_EXCLUSION_ZONES) if (hypot(x - p[0], z - p[1]) < p[2]) return 0;
     let d = sstep(0.52, 0.64, fbm(x * 0.022, 4, z * 0.022, 3)) * 0.5;
-    for (const p of KELPZ) d = max(d, p[3] * sstep(p[2], p[2] * 0.75, hypot(x - p[0], z - p[1])));
+    for (const p of KELP_REGIONS) d = max(d, p[3] * sstep(p[2], p[2] * 0.75, hypot(x - p[0], z - p[1])));
     return d;
   };
   const occ = new Set();
@@ -149,14 +159,14 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   const tryColumn = (x, z, kind, force, dens = 1) => {
     const key = floor(x / 2.3) * 4096 + floor(z / 2.3);
     if (occ.has(key)) return;
-    const f = floorsAt(x, z); const c = [];
+    const f = findVerticalSurfaces(x, z); const c = [];
     for (let i = 0; i < f.length; i += 2) if (f[i + 1] > 9) c.push(i);
     if (!c.length) return;
     const i = c[(random01() * c.length) | 0], y = f[i];
-    if (grad(x, y, z)[1] < 0.55) return;
+    if (densityNormal(x, y, z)[1] < 0.55) return;
     if (!force && flyPts.some((p) => hypot(x - p[0], z - p[2]) < 5)) return;
     occ.add(key);
-    column(x, y - 0.3, z, min(f[i + 1] - randomRange(0.8, 5), force ? randomRange(30, 42) : randomRange(15, 40)), kind, dens);
+    addKelpColumn(x, y - 0.3, z, min(f[i + 1] - randomRange(0.8, 5), force ? randomRange(30, 42) : randomRange(15, 40)), kind, dens);
   };
   // hand-placed columns framing the viewpoints: x, z, kind, density
   for (const p of [[...rel(0, 11, -8.5), 0], [...rel(0, 16, -10.5), 0], [...rel(0, 21, -9), 0], [...rel(0, 9, 7), 0], [...rel(0, 14, 9.5), 0], [...rel(0, 19, 8), 0], [...rel(0, 26, 6), 0],
@@ -183,10 +193,10 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   const hot = (x, z) => { let h = 0.4; for (const p of HOT) h = max(h, sstep(p[2], p[2] * 0.4, hypot(x - p[0], z - p[1]))); return h; };
   resetRandomSeed(3);
   for (let i = 0; i < 40000; i++) {
-    const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
+    const k = pickRandomTerrainVertex(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
     if (hypot(x, z) > 172 || y > -6) continue;
     const h = hot(x, z), zp = zoneP(x, z), u = random01();
-    if (nearFly(x, y, z, 4) || hypot(x + 1, z - 2) < 9 || nearPose(x, z, 8)) continue;
+    if (nearFlythroughPath(x, y, z, 4) || hypot(x + 1, z - 2) < 9 || nearPresetViewpoint(x, z, 8)) continue;
     if (ny > 0.75 && u < 0.10 * h) cluster(x, y, z, 8 + random01() * 14 | 0, 2, 1.0, 3.0, 0.13, 0.26, 0.6, 2.5);
     else if (ny > 0.6 && u < 0.10 * h + 0.07 * max(zp, h * 0.4)) cluster(x, y, z, 10 + random01() * 18 | 0, random01() < 0.8 ? 3 : 4, 0.9, 2.6, 0.14, 0.28, 0.9, 1.5);
     else if (ny < -0.35 && u < 0.5 * max(zp, 0.2)) { // hanging fronds
@@ -201,20 +211,20 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   resetRandomSeed(4);
   for (const p of MAGENTA) for (let i = p[2] * p[2] * PI * 45; i > 0; i--) {
     const a = random01() * TAU, r = sqrt(random01()) * p[2], x = p[0] + cos(a) * r, z = p[1] + sin(a) * r;
-    if (random01() > magAt(x, z) + 0.12 || nearPose(x, z)) continue;
-    const f = floorsAt(x, z); if (!f.length) continue;
-    const y = f[f.length - 2]; if (grad(x, y, z)[1] < 0.7) continue;
+    if (random01() > magAt(x, z) + 0.12 || nearPresetViewpoint(x, z)) continue;
+    const f = findVerticalSurfaces(x, z); if (!f.length) continue;
+    const y = f[f.length - 2]; if (densityNormal(x, y, z)[1] < 0.7) continue;
     const nl = 2 + (random01() * 3 | 0), yw = random01() * TAU;
     for (let j = 0; j < nl; j++) addLeaf(small, x, y - 0.03, z, randomRange(0.08, 0.26), yw + j * TAU / nl + randomRange(-0.4, 0.4), randomRange(0.15, 0.85), randomRange(0.035, 0.07), 0, 5, random01(), random01(), randomRange(0.3, 0.7));
     if (random01() < 0.3) for (let j = 0; j < 2; j++) addLeaf(small, x + randomRange(-0.2, 0.2), y - 0.04, z + randomRange(-0.2, 0.2), randomRange(0.2, 0.55), random01() * TAU, randomRange(0.05, 0.6), randomRange(0.03, 0.06), 0, 7, random01(), random01(), randomRange(0.3, 0.8));
-    if (random01() < 0.3) glint(x, y + randomRange(0.08, 0.22), z, 0, random01(), 0.82 + random01() * 0.18, randomRange(0.01, 0.02), 0);
+    if (random01() < 0.3) addGlint(x, y + randomRange(0.08, 0.22), z, 0, random01(), 0.82 + random01() * 0.18, randomRange(0.01, 0.02), 0);
   }
   resetRandomSeed(5);
   for (let i = 0; i < 620000; i++) {
-    const k = pickV(), ny = T.wn[k + 1];
+    const k = pickRandomTerrainVertex(), ny = T.wn[k + 1];
     if (ny < 0.72) continue;
     const x = T.wp[k] + randomRange(-0.45, 0.45), z = T.wp[k + 2] + randomRange(-0.45, 0.45), y = T.wp[k + 1];
-    if (hypot(x, z) > 170 || nearPose(x, z)) continue;
+    if (hypot(x, z) > 170 || nearPresetViewpoint(x, z)) continue;
     const m = magAt(x, z), zp = zoneP(x, z), u = random01();
     if (m > 0.3 && u < m * 0.9) for (let j = 0; j < 4; j++) addLeaf(small, x + randomRange(-0.1, 0.1), y - 0.05, z + randomRange(-0.1, 0.1), randomRange(0.12, 0.34), random01() * TAU, randomRange(0.05, 0.75), randomRange(0.04, 0.08), 0, 5, random01(), random01(), randomRange(0.3, 0.7));
     else if (u < m * 0.9 + 0.5 * max(zp, hot(x, z)) * sstep(0.42, 0.6, fbm(x * 0.09, 9, z * 0.09, 2))) for (let j = 0; j < 3; j++) addLeaf(small, x + randomRange(-0.1, 0.1), y - 0.05, z + randomRange(-0.1, 0.1), randomRange(0.25, 0.7), random01() * TAU, randomRange(0.1, 0.8), randomRange(0.05, 0.1), 0, 7, random01(), random01(), randomRange(0.3, 0.8));
@@ -226,12 +236,12 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   const zw = (x, z) => { let h = 0.45; for (const p of ZS) h = max(h, p[3] * sstep(p[2], p[2] * 0.4, hypot(x - p[0], z - p[1]))); return h; };
   resetRandomSeed(6);
   for (let i = 0; i < 13000; i++) {
-    const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
-    if (hypot(x, z) > 170 || y > -8 || T.wn[k + 1] < -0.15 || random01() > zw(x, z) || nearFly(x, y, z, 3)) continue;
-    const n0 = [T.wn[k], T.wn[k + 1], T.wn[k + 2]], [t1, t2] = tangent(n0), coral = T.wn[k + 1] > 0.85 || random01() < 0.35, cnt = coral ? 2 + random01() * 5 | 0 : 3 + random01() * 9 | 0, sd = random01();
+    const k = pickRandomTerrainVertex(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
+    if (hypot(x, z) > 170 || y > -8 || T.wn[k + 1] < -0.15 || random01() > zw(x, z) || nearFlythroughPath(x, y, z, 3)) continue;
+    const n0 = [T.wn[k], T.wn[k + 1], T.wn[k + 2]], [t1, t2] = surfaceTangentBasis(n0), coral = T.wn[k + 1] > 0.85 || random01() < 0.35, cnt = coral ? 2 + random01() * 5 | 0 : 3 + random01() * 9 | 0, sd = random01();
     for (let j = 0; j < cnt; j++) {
       const a = randomRange(-1, 1) * (0.5 + cnt * 0.13), b = randomRange(-1, 1) * (0.5 + cnt * 0.13);
-      const s = snap(x + t1[0] * a + t2[0] * b, y + t1[1] * a + t2[1] * b, z + t1[2] * a + t2[2] * b, n0);
+      const s = projectOntoRockSurface(x + t1[0] * a + t2[0] * b, y + t1[1] * a + t2[1] * b, z + t1[2] * a + t2[2] * b, n0);
       if (!s) continue;
       let ux = s[3], uy = s[4] + (coral ? 0.9 : 1.1), uz = s[5]; const l = hypot(ux, uy, uz); ux /= l; uy /= l; uz /= l;
       const q = multiplyQuaternions(quaternionFromUp(ux, uy, uz), quaternionFromAxisAngle(0, 1, 0, random01() * TAU)), sc = coral ? randomRange(0.5, 1.5) : randomRange(0.35, 0.9) * (random01() < 0.1 ? 1.6 : 1);
@@ -245,8 +255,8 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   for (const g of [[-68, -6, 9, 260], [-66, 6, 7, 160], [16, 72, 7, 200], [-6, 74, 6, 120], [-13, -2, 6, 80], [8, -88, 8, 160], [44, 12, 7, 120], [-62, 22, 6, 140], [-47, 40, 6, 140], [-30, 47, 6, 120], [-12, 48, 5, 100], [14, 28, 6, 140], [28, 45, 6, 120], [-36, -76, 6, 130], [-49, -58, 6, 130], [-58, -38, 6, 120]]) {
     let made = 0;
     for (let i = 0; i < 400000 && made < g[3]; i++) {
-      const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
-      if (hypot(x - g[0], z - g[1]) > g[2] || y > -14 || T.wn[k + 1] < -0.1 || nearFly(x, y, z, 2.2)) continue;
+      const k = pickRandomTerrainVertex(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2];
+      if (hypot(x - g[0], z - g[1]) > g[2] || y > -14 || T.wn[k + 1] < -0.1 || nearFlythroughPath(x, y, z, 2.2)) continue;
       made++;
       const coral = T.wn[k + 1] > 0.85 || random01() < 0.3, nx = T.wn[k], ny = T.wn[k + 1] + (coral ? 0.9 : 1.1), nz = T.wn[k + 2], l = hypot(nx, ny, nz);
       const sc = coral ? randomRange(0.5, 1.4) : randomRange(0.35, 0.9) * (random01() < 0.15 ? 1.7 : 1);
@@ -254,40 +264,40 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
     }
   }
   // --- rocks: floating boulder clusters + scattered ground rocks
-  const BOULD = [[-11, -11, -105, 14, 5], [-56, -19, -18, 18, 6], [10, -13, -88, 22, 7], [24, -15, -24, 22, 7], [-18, -12, 4, 14, 6], [30, -14, 30, 16, 6], [36, -12, -70, 22, 8], [-30, -13, -84, 16, 7], [-58, -14, 0, 14, 6], [19, -13, 98, 18, 6], [62, -9, 34, 14, 6]];
+  const FLOATING_BOULDERS = [[-11, -11, -105, 14, 5], [-56, -19, -18, 18, 6], [10, -13, -88, 22, 7], [24, -15, -24, 22, 7], [-18, -12, 4, 14, 6], [30, -14, 30, 16, 6], [36, -12, -70, 22, 8], [-30, -13, -84, 16, 7], [-58, -14, 0, 14, 6], [19, -13, 98, 18, 6], [62, -9, 34, 14, 6]];
   resetRandomSeed(8);
-  for (let i = 0; i < 9; i++) { const a = random01() * TAU, r = randomRange(60, 150); BOULD.push([cos(a) * r, randomRange(-20, -9), sin(a) * r, 10 + random01() * 12 | 0, randomRange(5, 9)]); }
-  for (const b of BOULD) for (let i = 0; i < b[3]; i++) {
+  for (let i = 0; i < 9; i++) { const a = random01() * TAU, r = randomRange(60, 150); FLOATING_BOULDERS.push([cos(a) * r, randomRange(-20, -9), sin(a) * r, 10 + random01() * 12 | 0, randomRange(5, 9)]); }
+  for (const b of FLOATING_BOULDERS) for (let i = 0; i < b[3]; i++) {
     const sc = random01() < 0.12 ? randomRange(1.8, 3.2) : randomRange(0.35, 1.5);
     const x = b[0] + randomRange(-1, 1) * b[4], y = b[1] + randomRange(-1, 1) * b[4] * 0.6, z = b[2] + randomRange(-1, 1) * b[4];
-    if (Dw(x, y, z) > -sc) continue;
+    if (sampleWorldDensity(x, y, z) > -sc) continue;
     const bob = randomRange(0.12, 0.4), sd = random01();
     addSolidInstance(random01() * 4 | 0, x, min(y, -2 - sc), z, sc, randomQuaternion(), 1, sd, 1, bob);
     if (sc > 1.1) for (let j = 0; j < 7; j++) addSolidInstance(random01() * 4 | 0, x + randomRange(-1.6, 1.6) * sc, min(y, -2 - sc) + randomRange(-1.4, 1) * sc, z + randomRange(-1.6, 1.6) * sc, randomRange(0.1, 0.35), randomQuaternion(), 1, sd, 1, bob);
   }
   resetRandomSeed(9);
   for (let i = 0; i < 2600; i++) {
-    const k = pickV(); if (T.wn[k + 1] < 0.7 || hypot(T.wp[k], T.wp[k + 2]) > 170 || nearFly(T.wp[k], T.wp[k + 1], T.wp[k + 2], 6)) continue;
+    const k = pickRandomTerrainVertex(); if (T.wn[k + 1] < 0.7 || hypot(T.wp[k], T.wp[k + 2]) > 170 || nearFlythroughPath(T.wp[k], T.wp[k + 1], T.wp[k + 2], 6)) continue;
     const sc = randomRange(0.25, 1.3) * (random01() < 0.1 ? 2 : 1);
     addSolidInstance(random01() * 4 | 0, T.wp[k], T.wp[k + 1] + sc * 0.2, T.wp[k + 2], sc, randomQuaternion(), 1, random01(), 1, 0);
   }
 
   resetRandomSeed(10);
   for (let i = 0; i < 60000; i++) {
-    const k = pickV(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
-    if (hypot(x, z) > 172 || y > -3 || (ny > 0.8 && random01() < 0.6) || nearFly(x, y, z, 3.5)) continue;
+    const k = pickRandomTerrainVertex(), x = T.wp[k], y = T.wp[k + 1], z = T.wp[k + 2], ny = T.wn[k + 1];
+    if (hypot(x, z) > 172 || y > -3 || (ny > 0.8 && random01() < 0.6) || nearFlythroughPath(x, y, z, 3.5)) continue;
     const sc = (0.35 + 2.1 * pow(random01(), 2.6)) * (ny > 0.8 ? 0.5 : 1), q = randomQuaternion();
-    chunks[(sc > 1.15 ? 3 : 0) + (random01() * 3 | 0)][cellOf(x, z)].push(x - T.wn[k] * sc * 0.3, y - ny * sc * 0.3, z - T.wn[k + 2] * sc * 0.3, sc, q[0], q[1], q[2], q[3], 1, random01(), sc > 1.15 ? 0 : 96, 0);
+    chunks[(sc > 1.15 ? 3 : 0) + (random01() * 3 | 0)][worldCellIndex(x, z)].push(x - T.wn[k] * sc * 0.3, y - ny * sc * 0.3, z - T.wn[k + 2] * sc * 0.3, sc, q[0], q[1], q[2], q[3], 1, random01(), sc > 1.15 ? 0 : 96, 0);
   }
   resetRandomSeed(11);
   for (let i = 0; i < 170000; i++) { // pebbles and rubble on the sea floor
-    const k = pickV(), x = T.wp[k] + randomRange(-0.4, 0.4), z = T.wp[k + 2] + randomRange(-0.4, 0.4), y = T.wp[k + 1];
-    if (T.wn[k + 1] < 0.8 || hypot(x, z) > 170 || nearFly(x, y, z, 1.3)) continue;
+    const k = pickRandomTerrainVertex(), x = T.wp[k] + randomRange(-0.4, 0.4), z = T.wp[k + 2] + randomRange(-0.4, 0.4), y = T.wp[k + 1];
+    if (T.wn[k + 1] < 0.8 || hypot(x, z) > 170 || nearFlythroughPath(x, y, z, 1.3)) continue;
     const sc = 0.05 + 0.3 * pow(random01(), 2), q = randomQuaternion();
-    nth++ % THIN || chunks[6][cellOf(x, z)].push(x, y - sc * 0.25, z, sc, q[0], q[1], q[2], q[3], 1, random01(), 44, 0);
+    nth++ % THIN || chunks[6][worldCellIndex(x, z)].push(x, y - sc * 0.25, z, sc, q[0], q[1], q[2], q[3], 1, random01(), 44, 0);
   }
   // --- set pieces
-  const gy = (x, z) => { const f = floorsAt(x, z); return f.length ? f[f.length - 2] : -45; };
+  const gy = (x, z) => { const f = findVerticalSurfaces(x, z); return f.length ? f[f.length - 2] : -45; };
   addSolidInstance(10, -5, gy(-5, -4) - 0.6, -4, 1, multiplyQuaternions(quaternionFromAxisAngle(0, 1, 0, 1.2), multiplyQuaternions(quaternionFromAxisAngle(0, 0, 1, 0.16), quaternionFromAxisAngle(1, 0, 0, -0.3))), 2, 0.3, 1, 0);          // whale fluke
   addSolidInstance(11, 59.5, -23, 6, 1, multiplyQuaternions(quaternionFromAxisAngle(0, 1, 0, -PI / 2), multiplyQuaternions(quaternionFromAxisAngle(0, 0, 1, -0.1), quaternionFromAxisAngle(1, 0, 0, 0.32))), 3, 0.5, 1, 0); // ship hull
   // barrel sponges in front of viewpoint 4, small sponges around the fluke base
@@ -296,10 +306,10 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
   for (let i = 0; i < 9; i++) { const a = random01() * TAU; const x = -5 + cos(a) * randomRange(1.2, 2.6), z = -4 + sin(a) * randomRange(1.5, 4); addSolidInstance(6, x, gy(x, z) + 0.05, z, randomRange(0.4, 0.9), quaternionFromAxisAngle(0, 1, 0, random01() * 6), 4, random01(), 1, 0); }
 
   // --- bubbles
-  const VENTS = [[4, -44, -3], [4.5, -44, -3.5], [-1, -44, 2], [2, -44, -1], [5.5, -44, -7], [3, -44, -9], [6, -44, -90], [8, -44, -84], [4, -44, -93], [-9, -44, 3], [5, -35, -86], [9, -37, -92], [40, -44, 20], [-56, -44, 12], [10, -44, 80], [-2, -44, 30], [0, -44, -30], [12, -44, 2], [6, -44, -2], [46, -44, 30], [-20, -44, -103], [-52, -44, -12], [4, -44, 70], [9, -44, -74], [4, -44, -78], [14, -44, 26], [26, -44, 40], [-45, -44, -64], [-55, -44, -40], [-58, -44, 22], [-40, -44, 40], [-14, -44, 45], [-1, -44, -9], [-7, -44, -6]];
+  const BUBBLE_VENTS = [[4, -44, -3], [4.5, -44, -3.5], [-1, -44, 2], [2, -44, -1], [5.5, -44, -7], [3, -44, -9], [6, -44, -90], [8, -44, -84], [4, -44, -93], [-9, -44, 3], [5, -35, -86], [9, -37, -92], [40, -44, 20], [-56, -44, 12], [10, -44, 80], [-2, -44, 30], [0, -44, -30], [12, -44, 2], [6, -44, -2], [46, -44, 30], [-20, -44, -103], [-52, -44, -12], [4, -44, 70], [9, -44, -74], [4, -44, -78], [14, -44, 26], [26, -44, 40], [-45, -44, -64], [-55, -44, -40], [-58, -44, 22], [-40, -44, 40], [-14, -44, 45], [-1, -44, -9], [-7, -44, -6]];
   resetRandomSeed(13);
-  for (const s of spots) if (random01() < 0.28) VENTS.push(s);
-  for (const v of VENTS) {
+  for (const s of spots) if (random01() < 0.28) BUBBLE_VENTS.push(s);
+  for (const v of BUBBLE_VENTS) {
     const n = 90 + random01() * 70 | 0, y0 = v[1] === -44 ? gy(v[0], v[2]) : v[1];
     for (let i = 0; i < n; i++) {
       const sz = random01() < 0.24 ? randomRange(0.1, 0.3) : randomRange(0.025, 0.08);
@@ -330,7 +340,7 @@ function populateProceduralWorld(D, T, flyPts, POSES) {
     for (let z = 0; z < hz; z++) for (let x = 0; x < hx; x++) { const i = x + hx * z; tmp[i] = (Lp[x > 0 ? i - 1 : i] + 2 * Lp[i] + Lp[x < hx - 1 ? i + 1 : i]) * 0.25; }
     for (let z = 0; z < hz; z++) for (let x = 0; x < hx; x++) {
       const i = x + hx * z, b = (tmp[z > 0 ? i - hx : i] + 2 * tmp[i] + tmp[z < hz - 1 ? i + hx : i]) * 0.25;
-      const g0 = gi(x * 2, y * 2, z * 2);
+      const g0 = densityGridIndex(x * 2, y * 2, z * 2);
       const d = (D[g0] + D[g0 + 1] + D[g0 + NX] + D[g0 + NX + 1] + D[g0 + NX * NY] + D[g0 + NX * NY + 1] + D[g0 + NX * NY + NX] + D[g0 + NX * NY + NX + 1]) * 0.125;
       const o = x + hx * (y + hy * z);
       const l = b * clamp(0.5 - d / 1.5, 0, 1) * (1 - min(kelpAbs[o], 0.5));
