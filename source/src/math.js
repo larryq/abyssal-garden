@@ -3,49 +3,51 @@
 // ============================================================================
 const { sin, cos, sqrt, min, max, abs, floor, PI, pow, atan2, hypot, exp, round } = Math;
 const TAU = PI * 2;
+// Each procedural subsystem resets this seed before populating its objects.
+// This is a deterministic PRNG (Mulberry32), not a cryptographic generator.
 let _seed = 20261110;
-const rnd = () => {
+const random01 = () => {
   _seed = (_seed + 0x6D2B79F5) | 0;
   let t = Math.imul(_seed ^ (_seed >>> 15), 1 | _seed);
   t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 };
-const rr = (a, b) => a + (b - a) * rnd();
+const randomRange = (a, b) => a + (b - a) * random01();
 // each generator system starts its own random stream, so the systems stay independent
-const rseed = (s) => { _seed = (20261110 + Math.imul(s, 7919)) | 0; };
+const resetRandomSeed = (s) => { _seed = (20261110 + Math.imul(s, 7919)) | 0; };
 const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
 const mix = (a, b, t) => a + (b - a) * t;
 const sstep = (a, b, x) => { x = clamp((x - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
 
-const ihash = (x, y, z) => {
+const hashGridCoordinates = (x, y, z) => {
   let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1274126177)) | 0;
   h = Math.imul(h ^ (h >>> 13), 1274126177);
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 };
-const vnoise = (x, y, z) => {
+const valueNoise3D = (x, y, z) => {
   const ix = floor(x), iy = floor(y), iz = floor(z);
   let fx = x - ix, fy = y - iy, fz = z - iz;
   fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy); fz = fz * fz * (3 - 2 * fz);
-  const a = mix(mix(ihash(ix, iy, iz), ihash(ix + 1, iy, iz), fx), mix(ihash(ix, iy + 1, iz), ihash(ix + 1, iy + 1, iz), fx), fy);
-  const b = mix(mix(ihash(ix, iy, iz + 1), ihash(ix + 1, iy, iz + 1), fx), mix(ihash(ix, iy + 1, iz + 1), ihash(ix + 1, iy + 1, iz + 1), fx), fy);
+  const a = mix(mix(hashGridCoordinates(ix, iy, iz), hashGridCoordinates(ix + 1, iy, iz), fx), mix(hashGridCoordinates(ix, iy + 1, iz), hashGridCoordinates(ix + 1, iy + 1, iz), fx), fy);
+  const b = mix(mix(hashGridCoordinates(ix, iy, iz + 1), hashGridCoordinates(ix + 1, iy, iz + 1), fx), mix(hashGridCoordinates(ix, iy + 1, iz + 1), hashGridCoordinates(ix + 1, iy + 1, iz + 1), fx), fy);
   return mix(a, b, fz);
 };
 const fbm = (x, y, z, o = 4) => {
   let a = 0.5, s = 0;
-  for (let i = 0; i < o; i++) { s += a * vnoise(x, y, z); x = x * 2.03 + 17.1; y = y * 2.03 + 31.7; z = z * 2.03 + 5.3; a *= 0.5; }
+  for (let i = 0; i < o; i++) { s += a * valueNoise3D(x, y, z); x = x * 2.03 + 17.1; y = y * 2.03 + 31.7; z = z * 2.03 + 5.3; a *= 0.5; }
   return s / (1 - 2 * a);
 };
 
 // quaternion helpers (return plain arrays; load-time only)
-const qAxis = (x, y, z, a) => { const l = hypot(x, y, z) || 1, s = sin(a / 2) / l; return [x * s, y * s, z * s, cos(a / 2)]; };
-const qMul = (a, b) => [
+const quaternionFromAxisAngle = (x, y, z, a) => { const l = hypot(x, y, z) || 1, s = sin(a / 2) / l; return [x * s, y * s, z * s, cos(a / 2)]; };
+const multiplyQuaternions = (a, b) => [
   a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
   a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
   a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
   a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]];
-const qRand = () => { const q = [rr(-1, 1), rr(-1, 1), rr(-1, 1), rr(-1, 1)]; const l = hypot(...q) || 1; return q.map((v) => v / l); };
+const randomQuaternion = () => { const q = [randomRange(-1, 1), randomRange(-1, 1), randomRange(-1, 1), randomRange(-1, 1)]; const l = hypot(...q) || 1; return q.map((v) => v / l); };
 // shortest rotation taking +Y to n
-const qFromY = (nx, ny, nz) => {
+const quaternionFromUp = (nx, ny, nz) => {
   if (ny < -0.9999) return [1, 0, 0, 0];
   const q = [nz, 0, -nx, 1 + ny]; const l = hypot(...q); return q.map((v) => v / l);
 };
@@ -55,9 +57,13 @@ const NX = 512, NY = 80, NZ = 512, VS = 0.75, OX = -192, OY = -56, OZ = -192;
 const CELLS = 16, CELLW = 24; // culling grid over XZ
 const NCHUNK = 7; // 3 small + 3 large rock chunk meshes + pebbles
 
-// ---------------------------------------------------------------- naive surface nets
+// ---------------------------------------------------------------- surface nets
+// An isosurface is where the signed density crosses zero. For each mixed-sign
+// cell, interpolate the crossing points of its edges and place one vertex at
+// their average. Neighboring vertices become quads (stored as triangles).
+// This handles caves and arches that cannot be represented by a heightfield.
 // D: scalar field (>0 inside), dims nx,ny,nz. Returns grid-space positions + triangle indices.
-function surfaceNets(D, nx, ny, nz) {
+function extractSurfaceNets(D, nx, ny, nz) {
   let pos = new Float32Array(1 << 20), nv = 0;
   let idx = new Uint32Array(1 << 21), ni = 0;
   const sl = nx * ny;
@@ -114,7 +120,7 @@ function surfaceNets(D, nx, ny, nz) {
 }
 
 // trilinear sampler factory over a scalar grid (grid coords)
-const sampler3 = (D, nx, ny, nz) => (x, y, z) => {
+const createTrilinearSampler = (D, nx, ny, nz) => (x, y, z) => {
   x = clamp(x, 0, nx - 1.001); y = clamp(y, 0, ny - 1.001); z = clamp(z, 0, nz - 1.001);
   const ix = x | 0, iy = y | 0, iz = z | 0, fx = x - ix, fy = y - iy, fz = z - iz;
   const i = ix + nx * (iy + ny * iz), sl = nx * ny;
